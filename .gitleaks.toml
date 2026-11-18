@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Beweird SAS
+# SPDX-License-Identifier: Apache-2.0
+#
+# gitleaks, as the export's audit runs it before each snapshot and as anyone can run it here:
+#   gitleaks detect --no-git --source . --config .gitleaks.toml --redact
+[extend]
+useDefault = true
+
+[allowlist]
+description = "The examples' receipt and the demo dossier hold compact JWS signatures (the receipt, signature.jws) and public keys. A signature is not a secret — anyone holding the evidence holds it — and the demo key that made them was generated in memory, its private half never written."
+paths = [
+  '''examples/receipt\.txt$''',
+  '''examples/demo-dossier\.zip$''',
+]

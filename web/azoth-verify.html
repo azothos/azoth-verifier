@@ -1,0 +1,2856 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2026 Beweird SAS -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-S/oN5rNiWxb+97mRoVhxllpgHuldcCa+T4eeGtO5csY='; style-src 'sha256-lHxxUH+Eb0EhJvdmeItoNjOkKxQgrF37I3kwoL0CNYo='; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Azoth verifier — offline</title>
+<style>/* SPDX-FileCopyrightText: 2026 Beweird SAS */
+/* SPDX-License-Identifier: Apache-2.0 */
+:root { --bg: #ffffff; --fg: #14181c; --muted: #5b6570; --line: #d9dee3; --pass: #1d6b4f; --warn: #8a5a00; --fail: #a3262a; color-scheme: light dark; }
+@media (prefers-color-scheme: dark) { :root { --bg: #111417; --fg: #e8ecef; --muted: #9aa5ae; --line: #2c3338; --pass: #5fc79a; --warn: #e0b04f; --fail: #f07f82; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 32px 16px 48px; display: flex; flex-direction: column; gap: 8px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+.lead, .note { color: var(--muted); margin: 0 0 12px; }
+label { font-size: 13px; color: var(--muted); margin-top: 8px; }
+input[type="file"], textarea { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; font: inherit; }
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+button { margin-top: 12px; align-self: flex-start; padding: 8px 20px; border: 0; border-radius: 6px; background: var(--fg); color: var(--bg); font: inherit; font-weight: 600; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: default; }
+#verdict { font-weight: 600; margin: 16px 0 0; }
+ol { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+li { padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; overflow-wrap: anywhere; }
+li code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.pass { color: var(--pass); } .warn { color: var(--warn); } .fail { color: var(--fail); }
+li.pass, li.warn, li.fail { color: var(--fg); }
+li.pass strong { color: var(--pass); } li.warn strong { color: var(--warn); } li.fail strong { color: var(--fail); }
+</style>
+</head>
+<body>
+<main>
+  <h1 data-t="title">Azoth verifier — offline</h1>
+  <p class="lead" data-t="lead"></p>
+  <label for="dossier" data-t="dossier"></label>
+  <input id="dossier" type="file" accept=".zip,application/zip">
+  <label for="root" data-t="root"></label>
+  <input id="root" type="file" accept=".pem,.crt,.cer,text/plain">
+  <label for="receipt" data-t="receipt"></label>
+  <textarea id="receipt" rows="3" spellcheck="false"></textarea>
+  <label for="keys" data-t="keys"></label>
+  <input id="keys" type="file" accept=".json,application/json">
+  <button id="run" type="button" data-t="run">Verify</button>
+  <p id="verdict" role="status"></p>
+  <ol id="checks"></ol>
+  <p class="note" data-t="note"></p>
+</main>
+<script>"use strict";
+const M = Object.create(null);
+M.bytes = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Bytes, without Node's Buffer — so the same checks run in the CLI and in a browser
+ * (the offline web verifier). Plain Uint8Array, TextEncoder/TextDecoder.
+ */
+
+const enc = new TextEncoder();
+const utf8Dec = new TextDecoder('utf-8');
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/** UTF-8 bytes of a string. */
+const utf8 = s => enc.encode(s);
+/** A string from UTF-8 bytes. */
+const fromUtf8 = b => utf8Dec.decode(b);
+/** A string from bytes read one per character (latin1: what DER times and names in printable form use). */
+const fromLatin1 = b => { let s = ''; for (const x of b) s += String.fromCharCode(x); return s; };
+
+/** Lowercase hex. */
+const hex = b => { let s = ''; for (const x of b) s += x.toString(16).padStart(2, '0'); return s; };
+
+/** Bytes from hex (an odd or invalid digit throws). */
+function fromHex(h) {
+  if (h.length % 2 || /[^0-9a-f]/i.test(h)) throw new Error('not hex');
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+/** Bytes from base64 or base64url, padded or not (whitespace ignored). */
+function fromBase64(s) {
+  const t = String(s).replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+  if (/[^A-Za-z0-9+/]/.test(t) || t.length % 4 === 1) throw new Error('not base64');
+  const out = new Uint8Array(Math.floor((t.length * 3) / 4));
+  let o = 0; let acc = 0; let bits = 0;
+  for (const ch of t) {
+    acc = (acc << 6) | B64.indexOf(ch); bits += 6;
+    if (bits >= 8) { bits -= 8; out[o++] = (acc >> bits) & 0xff; }
+  }
+  return out.subarray(0, o);
+}
+
+/** base64url without padding. */
+function base64url(b) {
+  let s = '';
+  for (let i = 0; i < b.length; i += 3) {
+    const n = (b[i] << 16) | ((b[i + 1] ?? 0) << 8) | (b[i + 2] ?? 0);
+    s += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + (i + 1 < b.length ? B64[(n >> 6) & 63] : '') + (i + 2 < b.length ? B64[n & 63] : '');
+  }
+  return s.replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function concat(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function equal(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Bytes of a string (UTF-8), or the bytes as given. */
+const bytesOf = data => (typeof data === 'string' ? utf8(data) : data);
+
+return { utf8, fromUtf8, fromLatin1, hex, fromHex, fromBase64, base64url, concat, equal, bytesOf };
+})();
+M.der = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * DER reader (definite lengths, low tag numbers — all RFC 3161, RFC 5652 and X.509 need), written
+ * from the standards, shared by the timestamp check (Check 4) and the certificate reader.
+ * Zero dependencies, no Node API: it runs in the CLI and in the offline web verifier.
+ */
+const { hex, fromLatin1, fromUtf8 } = M.bytes;
+
+/** One TLV at `at`: its tag, the whole encoding and the value. */
+function tlv(buf, at = 0) {
+  if (at + 2 > buf.length) throw new Error('truncated DER');
+  const tag = buf[at];
+  let len = buf[at + 1];
+  let p = at + 2;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    if (n < 1 || n > 4) throw new Error('unsupported DER length');
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + buf[p++];
+  }
+  if (p + len > buf.length) throw new Error('truncated DER');
+  return { tag, whole: buf.subarray(at, p + len), body: buf.subarray(p, p + len) };
+}
+
+/** The TLVs inside a constructed node. */
+function items(node) {
+  const out = [];
+  for (let o = 0; o < node.body.length;) { const c = tlv(node.body, o); out.push(c); o += c.whole.length; }
+  return out;
+}
+
+function oidOf(node) {
+  const b = node.body;
+  const arcs = [Math.floor(b[0] / 40), b[0] % 40];
+  let v = 0n;
+  for (let i = 1; i < b.length; i++) {
+    v = (v << 7n) | BigInt(b[i] & 0x7f);
+    if (!(b[i] & 0x80)) { arcs.push(v); v = 0n; }
+  }
+  return arcs.join('.');
+}
+
+/** An INTEGER's value (unsigned reading of its bytes, as serials and key parts are). */
+const intOf = node => BigInt(`0x${hex(node.body) || '0'}`);
+
+/** UTCTime (0x17) or GeneralizedTime (0x18). */
+function timeOf(node) {
+  const s = fromLatin1(node.body);
+  const m = node.tag === 0x17
+    ? /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s)
+    : /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\.\d+)?Z$/.exec(s);
+  if (!m) throw new Error(`unsupported time ${s}`);
+  const y = node.tag === 0x17 ? (Number(m[1]) < 50 ? 2000 : 1900) + Number(m[1]) : Number(m[1]);
+  return new Date(Date.UTC(y, Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])));
+}
+
+/** A directory string (UTF8String, PrintableString, IA5String, T61String, BMPString). */
+function stringOf(node) {
+  if (node.tag === 0x1e) {   // BMPString: UTF-16BE
+    let s = '';
+    for (let i = 0; i + 1 < node.body.length; i += 2) s += String.fromCharCode((node.body[i] << 8) | node.body[i + 1]);
+    return s;
+  }
+  return node.tag === 0x0c ? fromUtf8(node.body) : fromLatin1(node.body);
+}
+
+return { tlv, items, oidOf, intOf, timeOf, stringOf };
+})();
+M.keys = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * What a public key, a signature and the scheme they are checked under must be — read ONCE, here,
+ * for both cryptographies: crypto.mjs (node:crypto, the command line's) and crypto-web.mjs (plain
+ * JavaScript, the web page's) ask this module before any arithmetic, so the two refuse exactly the
+ * same inputs. node:crypto never reads a key from its own encoding: it is given the key rebuilt from
+ * the parts read here, so a lenient reading there cannot accept what the web page refuses.
+ *
+ *   readPublicKey(spki)                                   SubjectPublicKeyInfo (DER) → its parts, or null
+ *   signedWith({ scheme, hash, spki, signature })         → { key, hash, r?, s? } when they fit, else null
+ *   ed25519Signed(x, signature)                           a JWK's `x` → the key's 32 bytes, or null
+ *   keyTrustAt(jwk, signedAt)                             a producer's published key at the instant it signed:
+ *                                                         refused at or after its declared compromise
+ *
+ * The rules (SPEC.md, « Keys and signatures »):
+ *   - DER only: minimal lengths, nothing after the last element, no unused bit in a key's BIT STRING;
+ *   - the scheme is the key's: rsa-pkcs1 an rsaEncryption key; rsa-pss an rsaEncryption key or an
+ *     id-RSASSA-PSS key (whose parameters, when present, must name the signature's hash for both the
+ *     digest and MGF1); ecdsa an id-ecPublicKey key on P-256, P-384 or P-521; ed25519 an Ed25519 key;
+ *   - a hash among sha1, sha256, sha384, sha512 (Ed25519 takes none: one given is ignored);
+ *   - RSA: a modulus of 512 to 16384 bits, odd; an exponent odd, at least 3, below the modulus, at
+ *     most 64 bits; a signature of exactly the modulus' length, below the modulus (RFC 8017 §8.1.2, §8.2.2);
+ *   - ECDSA: an uncompressed point (RFC 5480), on its curve, coordinates below the field prime; a
+ *     DER `SEQUENCE { INTEGER r, INTEGER s }`, both in [1, n − 1];
+ *   - Ed25519: a 32-byte key in its canonical encoding (RFC 8032 §5.1.3) with no parameters; a
+ *     64-byte signature whose S is below the group order L.
+ */
+const { oidOf } = M.der;
+const { fromBase64 } = M.bytes;
+
+// ── Big integers ─────────────────────────────────────────────────────────────
+
+const toBig = b => { let v = 0n; for (const x of b) v = (v << 8n) | BigInt(x); return v; };
+const mod = (a, m) => ((a % m) + m) % m;
+const bitLength = v => (v === 0n ? 0 : v.toString(2).length);
+const leBig = b => { let v = 0n; for (let i = b.length - 1; i >= 0; i--) v = (v << 8n) | BigInt(b[i]); return v; };
+
+// ── The NIST prime curves (FIPS 186-5), a = −3 ───────────────────────────────
+
+const curve = (name, size, p, b, gx, gy, n) => ({ name, size, p: BigInt(p), a: BigInt(p) - 3n, b: BigInt(b), g: [BigInt(gx), BigInt(gy)], n: BigInt(n) });
+const CURVES = {
+  '1.2.840.10045.3.1.7': curve('P-256', 32, '0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff', '0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b',
+    '0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296', '0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5', '0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551'),
+  '1.3.132.0.34': curve('P-384', 48, '0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff',
+    '0xb3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef',
+    '0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7',
+    '0x3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f',
+    '0xffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973'),
+  '1.3.132.0.35': curve('P-521', 66, '0x01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+    '0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b503f00',
+    '0x00c6858e06b70404e9cd9e3ecb662395b4429c648139053fb521f828af606b4d3dbaa14b5e77efe75928fe1dc127a2ffa8de3348b3c1856a429bf97e7e31c2e5bd66',
+    '0x011839296a789a3bc0045c8a5fb42c7d1bd998f54449579b446817afbd17273e662c97ee72995ef42640c550b9013fad0761353c7086a272c24088be94769fd16650',
+    '0x01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409'),
+};
+
+// ── Strict DER ───────────────────────────────────────────────────────────────
+
+/** One TLV at `at`, its length in minimal form; null when it is not DER. `end` is relative to `buf`. */
+function node(buf, at = 0) {
+  if (at + 2 > buf.length || (buf[at] & 0x1f) === 0x1f) return null;
+  let len = buf[at + 1];
+  let p = at + 2;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    if (n < 1 || n > 3 || p + n > buf.length || buf[p] === 0) return null;
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + buf[p++];
+    if (len < 0x80) return null;   // the short form was required
+  }
+  if (p + len > buf.length) return null;
+  return { tag: buf[at], body: buf.subarray(p, p + len), end: p + len };
+}
+/** `buf` as exactly one TLV, nothing after it. */
+const whole = buf => { const n = node(buf); return n && n.end === buf.length ? n : null; };
+/** A constructed node's elements, or null when one is not DER. */
+function elements(n) {
+  const out = [];
+  for (let o = 0; o < n.body.length;) { const c = node(n.body, o); if (!c) return null; out.push(c); o = c.end; }
+  return out;
+}
+/** A non-negative INTEGER in its minimal encoding, or null. */
+function uint(n) {
+  if (!n || n.tag !== 0x02 || !n.body.length) return null;
+  const b = n.body;
+  if (b[0] & 0x80 || (b[0] === 0 && b.length > 1 && !(b[1] & 0x80))) return null;
+  return toBig(b);
+}
+const isNull = n => n.tag === 0x05 && n.body.length === 0;
+/** An AlgorithmIdentifier → { oid, params }, or null. */
+function algorithm(n) {
+  const a = n && n.tag === 0x30 ? elements(n) : null;
+  if (!a || a.length < 1 || a.length > 2 || a[0].tag !== 0x06) return null;
+  return { oid: oidOf(a[0]), params: a[1] ?? null };
+}
+
+// ── Hashes and RSASSA-PSS parameters (RFC 4055) ──────────────────────────────
+
+const HASHES = ['sha1', 'sha256', 'sha384', 'sha512'];
+const HASH_OF = {
+  '1.3.14.3.2.26': 'sha1', '2.16.840.1.101.3.4.2.1': 'sha256', '2.16.840.1.101.3.4.2.2': 'sha384', '2.16.840.1.101.3.4.2.3': 'sha512',
+};
+const MGF1 = '1.2.840.113549.1.1.8';
+/** A hash AlgorithmIdentifier (parameters absent or NULL) → its name, or null. */
+function hashOf(n) {
+  const a = algorithm(n);
+  return a && (!a.params || isNull(a.params)) ? HASH_OF[a.oid] ?? null : null;
+}
+
+/**
+ * RSASSA-PSS-params → { hash, mgf1Hash, saltLength }, the defaults (SHA-1, MGF1 with SHA-1, 20)
+ * where a field is absent; `params` null (absent) gives the defaults too. Null when the parameters
+ * are not DER, name a hash or a mask function this verifier does not compute, or a trailer field
+ * other than 1.
+ */
+function pssParams(params) {
+  const out = { hash: 'sha1', mgf1Hash: 'sha1', saltLength: 20 };
+  if (!params) return out;
+  const fields = params.tag === 0x30 ? elements(params) : null;
+  if (!fields) return null;
+  let last = -1;
+  for (const f of fields) {
+    const i = f.tag - 0xa0;
+    if (i <= last || i > 3) return null;   // [0]..[3], in order, each once
+    last = i;
+    const inner = elements(f);
+    if (!inner || inner.length !== 1) return null;
+    if (i === 0) {
+      out.hash = hashOf(inner[0]);
+      if (!out.hash) return null;
+    } else if (i === 1) {
+      const mgf = algorithm(inner[0]);
+      if (!mgf || mgf.oid !== MGF1) return null;
+      out.mgf1Hash = hashOf(mgf.params);
+      if (!out.mgf1Hash) return null;
+    } else {
+      const v = uint(inner[0]);
+      if (v === null) return null;
+      if (i === 2) out.saltLength = Number(v);
+      else if (v !== 1n) return null;
+    }
+  }
+  return out;
+}
+
+// ── Public keys (SubjectPublicKeyInfo, RFC 5280 §4.1) ────────────────────────
+
+const RSA = '1.2.840.113549.1.1.1';
+const RSA_PSS = '1.2.840.113549.1.1.10';
+const EC = '1.2.840.10045.2.1';
+const ED25519 = '1.3.101.112';
+
+const P25519 = 2n ** 255n - 19n;
+const L25519 = 2n ** 252n + 27742317777372353535851937790883648493n;
+
+/** An Ed25519 public key in its canonical encoding: y below p, and no sign bit on x = 0. */
+function ed25519Bytes(b) {
+  if (!b || b.length !== 32) return null;
+  const y = leBig(b) & ((1n << 255n) - 1n);
+  if (y >= P25519) return null;
+  if (b[31] >> 7 && (y === 1n || y === P25519 - 1n)) return null;   // x = 0 exactly there
+  return b;
+}
+
+/** Big-endian bytes of an INTEGER's value, without its sign byte. */
+const magnitude = n => (n.body[0] === 0 && n.body.length > 1 ? n.body.subarray(1) : n.body);
+
+/**
+ * A SubjectPublicKeyInfo (DER) → `{ type: 'rsa' | 'rsa-pss', n, e, size, bytes: { n, e }, pss }`,
+ * `{ type: 'ec', curve, x, y, point }` or `{ type: 'ed25519', key }`; null for anything else.
+ */
+function readPublicKey(spki) {
+  const top = spki ? whole(spki) : null;
+  const parts = top && top.tag === 0x30 ? elements(top) : null;
+  if (!parts || parts.length !== 2) return null;
+  const alg = algorithm(parts[0]);
+  const bits = parts[1];
+  if (!alg || bits.tag !== 0x03 || bits.body.length < 2 || bits.body[0] !== 0) return null;
+  const key = bits.body.subarray(1);
+  if (alg.oid === RSA || alg.oid === RSA_PSS) {
+    let pss = null;
+    if (alg.oid === RSA && alg.params && !isNull(alg.params)) return null;
+    if (alg.oid === RSA_PSS && alg.params) { pss = pssParams(alg.params); if (!pss) return null; }
+    const k = whole(key);
+    const ne = k && k.tag === 0x30 ? elements(k) : null;
+    if (!ne || ne.length !== 2) return null;
+    const n = uint(ne[0]);
+    const e = uint(ne[1]);
+    if (n === null || e === null) return null;
+    const modBits = bitLength(n);
+    if (modBits < 512 || modBits > 16384 || !(n & 1n) || e < 3n || !(e & 1n) || e >= n || bitLength(e) > 64) return null;
+    return { type: alg.oid === RSA ? 'rsa' : 'rsa-pss', n, e, size: Math.ceil(modBits / 8), bytes: { n: magnitude(ne[0]), e: magnitude(ne[1]) }, pss };
+  }
+  if (alg.oid === EC) {
+    const c = alg.params && alg.params.tag === 0x06 ? CURVES[oidOf(alg.params)] : null;
+    if (!c || key.length !== 1 + 2 * c.size || key[0] !== 4) return null;
+    const x = toBig(key.subarray(1, 1 + c.size));
+    const y = toBig(key.subarray(1 + c.size));
+    if (x >= c.p || y >= c.p || mod(y * y - (x * x * x + c.a * x + c.b), c.p) !== 0n) return null;
+    return { type: 'ec', curve: c, x, y, point: key };
+  }
+  if (alg.oid === ED25519) {
+    if (alg.params) return null;   // RFC 8410 §3: absent
+    return ed25519Bytes(key) ? { type: 'ed25519', key } : null;
+  }
+  return null;
+}
+
+// ── Signatures ───────────────────────────────────────────────────────────────
+
+const KEYS_OF = { 'rsa-pkcs1': ['rsa'], 'rsa-pss': ['rsa', 'rsa-pss'], ecdsa: ['ec'], ed25519: ['ed25519'] };
+
+/** An ECDSA signature: DER `SEQUENCE { INTEGER r, INTEGER s }`, both in [1, n − 1] — else null. */
+function ecdsaSignature(signature, n) {
+  const top = whole(signature);
+  const rs = top && top.tag === 0x30 ? elements(top) : null;
+  if (!rs || rs.length !== 2) return null;
+  const r = uint(rs[0]);
+  const s = uint(rs[1]);
+  if (r === null || s === null || r < 1n || s < 1n || r >= n || s >= n) return null;
+  return { r, s };
+}
+
+/** A 64-byte Ed25519 signature whose S is below L (RFC 8032 §5.1.7). */
+const ed25519Signature = sig => sig.length === 64 && leBig(sig.subarray(32)) < L25519;
+
+/**
+ * Do the key, the scheme, the hash and the signature's encoding fit? `{ key, hash }` (with `r` and
+ * `s` for ECDSA) when they do — only the arithmetic is left — else null. Never throws.
+ */
+function signedWith({ scheme, hash, spki, signature }) {
+  try {
+    const key = readPublicKey(spki);
+    if (!key || !(Object.hasOwn(KEYS_OF, scheme) && KEYS_OF[scheme].includes(key.type)) || typeof signature?.length !== 'number') return null;
+    if (scheme === 'ed25519') return ed25519Signature(signature) ? { key, hash: null } : null;
+    if (!HASHES.includes(hash)) return null;
+    if (key.type === 'ec') {
+      const rs = ecdsaSignature(signature, key.curve.n);
+      return rs ? { key, hash, ...rs } : null;
+    }
+    // An id-RSASSA-PSS key with parameters signs only with their hash, in the digest and in MGF1.
+    if (key.pss && (key.pss.hash !== hash || key.pss.mgf1Hash !== hash)) return null;
+    if (signature.length !== key.size || toBig(signature) >= key.n) return null;
+    return { key, hash };
+  } catch {
+    return null;
+  }
+}
+
+/** A JWK's `x` and a signature fit Ed25519: the key's 32 bytes, else null. Never throws. */
+function ed25519Signed(x, signature) {
+  try {
+    const key = ed25519Bytes(fromBase64(x));
+    return key && typeof signature?.length === 'number' && ed25519Signature(signature) ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+// ── A producer's key, at the instant it signed ──────────────────────────────
+
+const STATUSES = ['active', 'retired', 'compromised'];
+
+/**
+ * May a signature dated `signedAt` (seconds — a JWS `iat`) be trusted under this published key? The ONE
+ * rule for every check that verifies under a producer's key — a dossier's or a platform package's signature
+ * (Check 12), a receipt (Check 10) — on the command line and on the web page alike (SPEC.md, « Keys and
+ * signatures »):
+ *   - a key its producer declared compromised (`status` "compromised") refuses every signature dated at or
+ *     after its `compromised_at`; one dated before it stands, with a warning: that date is the signer's own
+ *     claim, and whoever holds the key can write an earlier one;
+ *   - a compromised key without a readable `compromised_at`, or a status this verifier does not know, refuses
+ *     every signature;
+ *   - an active or retired key (or one with no status: an older producer) is trusted.
+ * Never throws. `{ ok: false, detail }`, or `{ ok: true, warn? }`.
+ * @param {{ status?: unknown, compromised_at?: unknown, compromise_declared_at?: unknown }} key
+ * @param {number} signedAt
+ */
+function keyTrustAt(key, signedAt) {
+  const status = key?.status;
+  if (status === undefined || status === null || status === 'active' || status === 'retired') return { ok: true };
+  if (!STATUSES.includes(status)) return { ok: false, detail: `its producer publishes it with a status this verifier does not know ("${String(status)}"): no signature under it is trusted` };
+  const from = typeof key.compromised_at === 'string' ? Date.parse(key.compromised_at) : NaN;
+  const declared = typeof key.compromise_declared_at === 'string' ? ` (declared ${key.compromise_declared_at})` : '';
+  if (!Number.isFinite(from)) return { ok: false, detail: `its producer declared it compromised${declared} without a readable instant: no signature under it is trusted` };
+  const at = Number.isFinite(signedAt) ? signedAt * 1000 : NaN;
+  if (!Number.isFinite(at) || at >= from) {
+    return { ok: false, detail: `it signed on ${Number.isFinite(at) ? new Date(at).toISOString() : 'an unreadable date'}, at or after ${new Date(from).toISOString()}, from when its producer declared it compromised${declared}: anyone holding the key could have made this signature` };
+  }
+  return { ok: true, warn: `its producer declared it compromised from ${new Date(from).toISOString()}${declared}; this signature is dated ${new Date(at).toISOString()}, before — but that date is the signer's own claim: only a trusted timestamp (Check 4) shows it existed then` };
+}
+
+return { toBig, mod, bitLength, CURVES, HASHES, pssParams, readPublicKey, signedWith, ed25519Signed, keyTrustAt };
+})();
+M.crypto = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * The verifier's cryptography in plain JavaScript — what the offline web page runs instead of
+ * crypto.mjs (node:crypto), with the same three functions. Verification only: no secret is ever
+ * handled, so nothing here needs to be constant-time. Written from the standards (FIPS 180-4,
+ * RFC 8017, FIPS 186-5 / SEC 1, RFC 8032); the producer's test suite holds every function to
+ * node:crypto on the same inputs.
+ *
+ * Which key, scheme, hash and signature encoding are acceptable is NOT decided here: keys.mjs
+ * reads them for both cryptographies, so this file only does the arithmetic. A signature is a
+ * verdict, never an exception: anything that does not verify — a key of another type than the
+ * scheme names, a malformed key or signature — is `false`, as in crypto.mjs.
+ */
+const { concat, equal } = M.bytes;
+const { signedWith, ed25519Signed, toBig, mod, bitLength } = M.keys;
+
+// ── SHA-1 / SHA-256 (32-bit words) ──────────────────────────────────────────
+
+const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+const rotl = (x, n) => (x << n) | (x >>> (32 - n));
+
+/** Message padding for 64-byte blocks, big-endian 64-bit length. */
+function pad64(msg) {
+  const len = msg.length;
+  const total = ((len + 9 + 63) >> 6) << 6;
+  const out = new Uint8Array(total);
+  out.set(msg);
+  out[len] = 0x80;
+  const bits = len * 8;
+  const dv = new DataView(out.buffer);
+  dv.setUint32(total - 8, Math.floor(bits / 2 ** 32));
+  dv.setUint32(total - 4, bits >>> 0);
+  return out;
+}
+
+const K256 = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+  0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+  0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+  0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function sha256(msg) {
+  const m = pad64(msg);
+  const dv = new DataView(m.buffer);
+  const h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+  const w = new Uint32Array(64);
+  for (let o = 0; o < m.length; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i]) >>> 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  const out = new Uint8Array(32);
+  const ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i]);
+  return out;
+}
+
+function sha1(msg) {
+  const m = pad64(msg);
+  const dv = new DataView(m.buffer);
+  const h = new Uint32Array([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]);
+  const w = new Uint32Array(80);
+  for (let o = 0; o < m.length; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+    for (let i = 16; i < 80; i++) w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    let [a, b, c, d, e] = h;
+    for (let i = 0; i < 80; i++) {
+      const [f, k] = i < 20 ? [(b & c) | (~b & d), 0x5a827999] : i < 40 ? [b ^ c ^ d, 0x6ed9eba1] : i < 60 ? [(b & c) | (b & d) | (c & d), 0x8f1bbcdc] : [b ^ c ^ d, 0xca62c1d6];
+      const t = (rotl(a, 5) + f + e + k + w[i]) >>> 0;
+      e = d; d = c; c = rotl(b, 30) >>> 0; b = a; a = t;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+  }
+  const out = new Uint8Array(20);
+  const ov = new DataView(out.buffer);
+  for (let i = 0; i < 5; i++) ov.setUint32(i * 4, h[i]);
+  return out;
+}
+
+// ── SHA-384 / SHA-512 (64-bit words, BigInt — small inputs only: signed attributes, Ed25519) ──
+
+const M64 = (1n << 64n) - 1n;
+const r64 = (x, n) => ((x >> n) | (x << (64n - n))) & M64;
+const K512 = [
+  '428a2f98d728ae22', '7137449123ef65cd', 'b5c0fbcfec4d3b2f', 'e9b5dba58189dbbc', '3956c25bf348b538', '59f111f1b605d019', '923f82a4af194f9b', 'ab1c5ed5da6d8118',
+  'd807aa98a3030242', '12835b0145706fbe', '243185be4ee4b28c', '550c7dc3d5ffb4e2', '72be5d74f27b896f', '80deb1fe3b1696b1', '9bdc06a725c71235', 'c19bf174cf692694',
+  'e49b69c19ef14ad2', 'efbe4786384f25e3', '0fc19dc68b8cd5b5', '240ca1cc77ac9c65', '2de92c6f592b0275', '4a7484aa6ea6e483', '5cb0a9dcbd41fbd4', '76f988da831153b5',
+  '983e5152ee66dfab', 'a831c66d2db43210', 'b00327c898fb213f', 'bf597fc7beef0ee4', 'c6e00bf33da88fc2', 'd5a79147930aa725', '06ca6351e003826f', '142929670a0e6e70',
+  '27b70a8546d22ffc', '2e1b21385c26c926', '4d2c6dfc5ac42aed', '53380d139d95b3df', '650a73548baf63de', '766a0abb3c77b2a8', '81c2c92e47edaee6', '92722c851482353b',
+  'a2bfe8a14cf10364', 'a81a664bbc423001', 'c24b8b70d0f89791', 'c76c51a30654be30', 'd192e819d6ef5218', 'd69906245565a910', 'f40e35855771202a', '106aa07032bbd1b8',
+  '19a4c116b8d2d0c8', '1e376c085141ab53', '2748774cdf8eeb99', '34b0bcb5e19b48a8', '391c0cb3c5c95a63', '4ed8aa4ae3418acb', '5b9cca4f7763e373', '682e6ff3d6b2b8a3',
+  '748f82ee5defb2fc', '78a5636f43172f60', '84c87814a1f0ab72', '8cc702081a6439ec', '90befffa23631e28', 'a4506cebde82bde9', 'bef9a3f7b2c67915', 'c67178f2e372532b',
+  'ca273eceea26619c', 'd186b8c721c0c207', 'eada7dd6cde0eb1e', 'f57d4f7fee6ed178', '06f067aa72176fba', '0a637dc5a2c898a6', '113f9804bef90dae', '1b710b35131c471b',
+  '28db77f523047d84', '32caab7b40c72493', '3c9ebe0a15c9bebc', '431d67c49c100d4c', '4cc5d4becb3e42b6', '597f299cfc657e2a', '5fcb6fab3ad6faec', '6c44198c4a475817',
+].map(h => BigInt(`0x${h}`));
+const IV512 = ['6a09e667f3bcc908', 'bb67ae8584caa73b', '3c6ef372fe94f82b', 'a54ff53a5f1d36f1', '510e527fade682d1', '9b05688c2b3e6c1f', '1f83d9abfb41bd6b', '5be0cd19137e2179'];
+const IV384 = ['cbbb9d5dc1059ed8', '629a292a367cd507', '9159015a3070dd17', '152fecd8f70e5939', '67332667ffc00b31', '8eb44a8768581511', 'db0c2e0d64f98fa7', '47b5481dbefa4fa4'];
+
+function sha512Family(msg, iv, outLen) {
+  const len = msg.length;
+  const total = ((len + 17 + 127) >> 7) << 7;
+  const m = new Uint8Array(total);
+  m.set(msg); m[len] = 0x80;
+  const dv = new DataView(m.buffer);
+  const bits = BigInt(len) * 8n;
+  dv.setBigUint64(total - 8, bits & M64);
+  const h = iv.map(x => BigInt(`0x${x}`));
+  const w = new Array(80);
+  for (let o = 0; o < total; o += 128) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getBigUint64(o + i * 8);
+    for (let i = 16; i < 80; i++) {
+      const s0 = r64(w[i - 15], 1n) ^ r64(w[i - 15], 8n) ^ (w[i - 15] >> 7n);
+      const s1 = r64(w[i - 2], 19n) ^ r64(w[i - 2], 61n) ^ (w[i - 2] >> 6n);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & M64;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 80; i++) {
+      const t1 = (hh + (r64(e, 14n) ^ r64(e, 18n) ^ r64(e, 41n)) + ((e & f) ^ (~e & M64 & g)) + K512[i] + w[i]) & M64;
+      const t2 = ((r64(a, 28n) ^ r64(a, 34n) ^ r64(a, 39n)) + ((a & b) ^ (a & c) ^ (b & c))) & M64;
+      hh = g; g = f; f = e; e = (d + t1) & M64; d = c; c = b; b = a; a = (t1 + t2) & M64;
+    }
+    for (const [i, v] of [a, b, c, d, e, f, g, hh].entries()) h[i] = (h[i] + v) & M64;
+  }
+  const out = new Uint8Array(64);
+  const ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setBigUint64(i * 8, h[i]);
+  return out.subarray(0, outLen);
+}
+
+const HASH = { sha1, sha256, sha384: m => sha512Family(m, IV384, 48), sha512: m => sha512Family(m, IV512, 64) };
+const HASH_LEN = { sha1: 20, sha256: 32, sha384: 48, sha512: 64 };
+
+function digest(alg, data) {
+  const f = HASH[alg];
+  if (!f) throw new Error(`unsupported hash ${alg}`);
+  return f(data);
+}
+
+// ── Big integers ─────────────────────────────────────────────────────────────
+
+function toBytes(v, len) {
+  const out = new Uint8Array(len);
+  for (let i = len - 1; i >= 0; i--) { out[i] = Number(v & 0xffn); v >>= 8n; }
+  return v === 0n ? out : null;   // did not fit
+}
+function modPow(b, e, m) {
+  let r = 1n; b = mod(b, m);
+  while (e > 0n) { if (e & 1n) r = (r * b) % m; b = (b * b) % m; e >>= 1n; }
+  return r;
+}
+function modInv(a, m) {
+  let [r0, r1, s0, s1] = [mod(a, m), m, 1n, 0n];
+  while (r1 !== 0n) { const q = r0 / r1; [r0, r1] = [r1, r0 - q * r1]; [s0, s1] = [s1, s0 - q * s1]; }
+  if (r0 !== 1n) throw new Error('not invertible');
+  return mod(s0, m);
+}
+
+// ── RSA: PKCS #1 v1.5 and PSS (RFC 8017) ─────────────────────────────────────
+
+const DIGEST_INFO = {
+  sha1: '3021300906052b0e03021a05000414', sha256: '3031300d060960864801650304020105000420',
+  sha384: '3041300d060960864801650304020205000430', sha512: '3051300d060960864801650304020305000440',
+};
+const fromHexStr = h => Uint8Array.from(h.match(/../g).map(x => parseInt(x, 16)));
+
+function rsaOpen(key, signature) {
+  const k = Math.ceil(bitLength(key.n) / 8);
+  if (signature.length !== k) return null;
+  const s = toBig(signature);
+  if (s >= key.n) return null;
+  return { em: toBytes(modPow(s, key.e, key.n), k), k };
+}
+
+function rsaPkcs1(key, hash, data, signature) {
+  const open = rsaOpen(key, signature);
+  if (!open || !DIGEST_INFO[hash]) return false;
+  const t = concat(fromHexStr(DIGEST_INFO[hash]), digest(hash, data));
+  if (open.k < t.length + 11) return false;
+  const want = new Uint8Array(open.k).fill(0xff);
+  want[0] = 0; want[1] = 1; want[open.k - t.length - 1] = 0;
+  want.set(t, open.k - t.length);
+  return equal(open.em, want);
+}
+
+function mgf1(hash, seed, len) {
+  const out = new Uint8Array(len);
+  for (let c = 0, o = 0; o < len; c++) {
+    const block = digest(hash, concat(seed, Uint8Array.of(c >>> 24, (c >>> 16) & 255, (c >>> 8) & 255, c & 255)));
+    out.set(block.subarray(0, Math.min(block.length, len - o)), o);
+    o += block.length;
+  }
+  return out;
+}
+
+function rsaPss(key, hash, data, signature) {
+  const open = rsaOpen(key, signature);
+  const hLen = HASH_LEN[hash];
+  if (!open || !hLen) return false;
+  const emBits = bitLength(key.n) - 1;
+  const emLen = Math.ceil(emBits / 8);
+  const em = open.em.subarray(open.k - emLen);
+  if (open.k > emLen && open.em[0] !== 0) return false;
+  if (emLen < hLen + 2 || em[emLen - 1] !== 0xbc) return false;
+  const masked = em.subarray(0, emLen - hLen - 1);
+  const h = em.subarray(emLen - hLen - 1, emLen - 1);
+  const zeroBits = 8 * emLen - emBits;
+  if (masked[0] >> (8 - zeroBits) && zeroBits) return false;
+  const db = mgf1(hash, h, masked.length).map((x, i) => x ^ masked[i]);
+  db[0] &= 0xff >> zeroBits;
+  let i = 0;
+  while (i < db.length && db[i] === 0) i++;
+  if (db[i] !== 1) return false;
+  const salt = db.subarray(i + 1);   // its length recovered, as node:crypto's RSA_PSS_SALTLEN_AUTO does
+  return equal(digest(hash, concat(new Uint8Array(8), digest(hash, data), salt)), h);
+}
+
+// ── ECDSA over the NIST prime curves (FIPS 186-5; the curves: keys.mjs) ─────
+
+// Jacobian coordinates; null is the point at infinity.
+function jDouble(c, P) {
+  if (!P || P[1] === 0n) return null;
+  const [x, y, z] = P; const p = c.p;
+  const z2 = (z * z) % p;
+  const m = mod(3n * (x - z2) * (x + z2), p);   // a = -3
+  const y2 = (y * y) % p;
+  const s = (4n * x * y2) % p;
+  const x3 = mod(m * m - 2n * s, p);
+  return [x3, mod(m * (s - x3) - 8n * y2 * y2, p), (2n * y * z) % p];
+}
+function jAdd(c, P, Q) {
+  if (!P) return Q;
+  if (!Q) return P;
+  const p = c.p;
+  const z1z1 = (P[2] * P[2]) % p; const z2z2 = (Q[2] * Q[2]) % p;
+  const u1 = (P[0] * z2z2) % p; const u2 = (Q[0] * z1z1) % p;
+  const s1 = (P[1] * Q[2] * z2z2) % p; const s2 = (Q[1] * P[2] * z1z1) % p;
+  if (u1 === u2) return s1 === s2 ? jDouble(c, P) : null;
+  const h = mod(u2 - u1, p); const r = mod(s2 - s1, p);
+  const h2 = (h * h) % p; const h3 = (h2 * h) % p;
+  const x3 = mod(r * r - h3 - 2n * u1 * h2, p);
+  return [x3, mod(r * (u1 * h2 - x3) - s1 * h3, p), (h * P[2] * Q[2]) % p];
+}
+function jMul(c, P, k) {
+  let R = null;
+  for (let i = bitLength(k) - 1; i >= 0; i--) {
+    R = jDouble(c, R);
+    if ((k >> BigInt(i)) & 1n) R = jAdd(c, R, P);
+  }
+  return R;
+}
+
+/** `key`: keys.mjs's — its point on its curve; r and s already in [1, n − 1]. */
+function ecdsa(key, hash, data, r, s) {
+  const c = key.curve;
+  const hb = digest(hash, data);
+  let e = toBig(hb);
+  const excess = hb.length * 8 - bitLength(c.n);
+  if (excess > 0) e >>= BigInt(excess);
+  const w = modInv(s, c.n);
+  const X = jAdd(c, jMul(c, [c.g[0], c.g[1], 1n], mod(e * w, c.n)), jMul(c, [key.x, key.y, 1n], mod(r * w, c.n)));
+  if (!X) return false;
+  const zi = modInv(X[2], c.p);
+  return mod(X[0] * zi * zi, c.p) % c.n === r;
+}
+
+// ── Ed25519 (RFC 8032 §5.1.7) ────────────────────────────────────────────────
+
+const P25519 = 2n ** 255n - 19n;
+const L25519 = 2n ** 252n + 27742317777372353535851937790883648493n;
+const D25519 = mod(-121665n * modInv(121666n, P25519), P25519);
+const SQRT_M1 = modPow(2n, (P25519 - 1n) / 4n, P25519);
+const leBig = b => { let v = 0n; for (let i = b.length - 1; i >= 0; i--) v = (v << 8n) | BigInt(b[i]); return v; };
+
+function edDecode(bytes) {
+  if (bytes.length !== 32) return null;
+  const y = leBig(bytes) & ((1n << 255n) - 1n);
+  const sign = bytes[31] >> 7;
+  if (y >= P25519) return null;
+  const y2 = (y * y) % P25519;
+  const u = mod(y2 - 1n, P25519); const v = mod(D25519 * y2 + 1n, P25519);
+  let x = (u * modPow(v, 3n, P25519) * modPow(u * modPow(v, 7n, P25519), (P25519 - 5n) / 8n, P25519)) % P25519;
+  const vx2 = (v * x * x) % P25519;
+  if (vx2 !== u) { if (vx2 === mod(-u, P25519)) x = (x * SQRT_M1) % P25519; else return null; }
+  if (x === 0n && sign) return null;
+  if (Number(x & 1n) !== sign) x = P25519 - x;
+  return [x, y, 1n, (x * y) % P25519];   // extended coordinates
+}
+function edAdd(P, Q) {
+  const p = P25519;
+  const a = ((P[1] - P[0]) * (Q[1] - Q[0])) % p; const b = ((P[1] + P[0]) * (Q[1] + Q[0])) % p;
+  const c = (2n * P[3] * Q[3] * D25519) % p; const d = (2n * P[2] * Q[2]) % p;
+  const e = b - a; const f = d - c; const g = d + c; const h = b + a;
+  return [mod(e * f, p), mod(g * h, p), mod(f * g, p), mod(e * h, p)];
+}
+function edMul(P, k) {
+  let R = [0n, 1n, 1n, 0n];
+  for (let i = bitLength(k) - 1; i >= 0; i--) { R = edAdd(R, R); if ((k >> BigInt(i)) & 1n) R = edAdd(R, P); }
+  return R;
+}
+const edEqual = (P, Q) => mod(P[0] * Q[2] - Q[0] * P[2], P25519) === 0n && mod(P[1] * Q[2] - Q[1] * P[2], P25519) === 0n;
+const B25519 = [15112221349535400772501151409588531511454012693041857206046113283949847762202n,
+  46316835694926478169428394003475163141307993866256225615783033603165251855960n, 1n, 0n];
+B25519[3] = (B25519[0] * B25519[1]) % P25519;
+
+function ed25519(publicKey, data, signature) {
+  if (signature.length !== 64) return false;
+  const A = edDecode(publicKey);
+  const R = edDecode(signature.subarray(0, 32));
+  const S = leBig(signature.subarray(32));
+  if (!A || !R || S >= L25519) return false;
+  const k = leBig(digest('sha512', concat(signature.subarray(0, 32), publicKey, data))) % L25519;
+  return edEqual(edMul(B25519, S), edAdd(R, edMul(A, k)));
+}
+
+// ── The adapter ──────────────────────────────────────────────────────────────
+
+function verifySignature({ scheme, hash, spki, data, signature }) {
+  try {
+    const fit = signedWith({ scheme, hash, spki, signature });
+    if (!fit) return false;
+    if (scheme === 'rsa-pkcs1') return rsaPkcs1(fit.key, fit.hash, data, signature);
+    if (scheme === 'rsa-pss') return rsaPss(fit.key, fit.hash, data, signature);
+    if (scheme === 'ecdsa') return ecdsa(fit.key, fit.hash, data, fit.r, fit.s);
+    return ed25519(fit.key.key, data, signature);
+  } catch {
+    return false;
+  }
+}
+
+function verifyEd25519(x, data, signature) {
+  try {
+    const key = ed25519Signed(x, signature);
+    return key ? ed25519(key, data, signature) : false;
+  } catch {
+    return false;
+  }
+}
+
+return { digest, verifySignature, verifyEd25519 };
+})();
+M.x509 = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * X.509 certificates read from their DER (RFC 5280) — what the timestamp check needs to find the
+ * TSA signer and walk its chain, with no Node API: it runs in the CLI and in the web verifier.
+ */
+const { tlv, items, oidOf, intOf, timeOf, stringOf } = M.der;
+const { equal, fromBase64, hex } = M.bytes;
+const { digest, verifySignature } = M.crypto;
+const { pssParams } = M.keys;
+
+const NAMES = {
+  '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.7': 'L', '2.5.4.8': 'ST', '2.5.4.10': 'O', '2.5.4.11': 'OU',
+  '2.5.4.5': 'serialNumber', '2.5.4.97': 'organizationIdentifier', '1.2.840.113549.1.9.1': 'emailAddress',
+};
+const EKU = '2.5.29.37';
+
+/** A Name rendered one attribute per line, `CN=…`, in the certificate's order. */
+function nameOf(node) {
+  const out = [];
+  for (const rdn of items(node)) for (const atv of items(rdn)) {
+    const [type, value] = items(atv);
+    out.push(`${NAMES[oidOf(type)] ?? oidOf(type)}=${stringOf(value)}`);
+  }
+  return out.join('\n');
+}
+
+/** A certificate's parts: serial, names, validity, public key, extended key usages, signature. */
+function parseCertificate(der) {
+  const cert = tlv(der);
+  const [tbsNode, sigAlgNode, sigNode] = items(cert);
+  const tbs = items(tbsNode);
+  let i = tbs[0].tag === 0xa0 ? 1 : 0;   // [0] version
+  const serial = intOf(tbs[i++]);
+  i++;                                    // signature (repeated outside the tbs)
+  const issuer = tbs[i++];
+  const [notBefore, notAfter] = items(tbs[i++]);
+  const subject = tbs[i++];
+  const spki = tbs[i++];
+  const eku = [];
+  for (const n of tbs.slice(i)) {
+    if (n.tag !== 0xa3) continue;
+    for (const ext of items(items(n)[0])) {
+      const parts = items(ext);
+      if (oidOf(parts[0]) !== EKU) continue;
+      for (const o of items(tlv(parts[parts.length - 1].body))) eku.push(oidOf(o));
+    }
+  }
+  const [alg, params] = items(sigAlgNode);
+  return {
+    der: cert.whole, tbs: tbsNode.whole, serial,
+    issuerRaw: issuer.whole, subjectRaw: subject.whole, issuer: nameOf(issuer), subject: nameOf(subject),
+    notBefore: timeOf(notBefore), notAfter: timeOf(notAfter), spki: spki.whole, eku,
+    sigAlg: oidOf(alg), sigParams: params ?? null, signature: sigNode.body.subarray(1),   // BIT STRING: unused-bits byte first
+    fingerprint256: hex(digest('sha256', cert.whole)),
+  };
+}
+
+/** PEM bundle → certificates. */
+function readPemCertificates(text) {
+  return (String(text).match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) ?? [])
+    .map(p => parseCertificate(fromBase64(p.replace(/-----(BEGIN|END) CERTIFICATE-----/g, ''))));
+}
+
+const RSA_WITH = {
+  '1.2.840.113549.1.1.5': 'sha1', '1.2.840.113549.1.1.11': 'sha256', '1.2.840.113549.1.1.12': 'sha384', '1.2.840.113549.1.1.13': 'sha512',
+};
+const ECDSA_WITH = {
+  '1.2.840.10045.4.1': 'sha1', '1.2.840.10045.4.3.2': 'sha256', '1.2.840.10045.4.3.3': 'sha384', '1.2.840.10045.4.3.4': 'sha512',
+};
+const RSA = '1.2.840.113549.1.1.1';
+const RSA_PSS = '1.2.840.113549.1.1.10';
+const ED25519 = '1.3.101.112';
+
+/**
+ * The scheme and hash of a signature algorithm. `digestHash`: a CMS SignerInfo's digest algorithm,
+ * for the plain `rsaEncryption` and `id-ecPublicKey` identifiers that leave the hash to it.
+ */
+function signatureScheme(oid, params, digestHash = null) {
+  if (RSA_WITH[oid]) return { scheme: 'rsa-pkcs1', hash: RSA_WITH[oid] };
+  if (oid === RSA && digestHash) return { scheme: 'rsa-pkcs1', hash: digestHash };
+  if (ECDSA_WITH[oid]) return { scheme: 'ecdsa', hash: ECDSA_WITH[oid] };
+  if (oid === '1.2.840.10045.2.1' && digestHash) return { scheme: 'ecdsa', hash: digestHash };
+  if (oid === ED25519) return { scheme: 'ed25519', hash: null };
+  if (oid === RSA_PSS) {
+    // RSASSA-PSS-params (RFC 4055; absent: the defaults, SHA-1). Both cryptographies compute MGF1
+    // with the signature's hash, so a mask on another hash is refused rather than misread; the salt
+    // length is recovered when verifying.
+    const p = pssParams(params && params.tag === 0x30 ? params : null);
+    return p && p.mgf1Hash === p.hash ? { scheme: 'rsa-pss', hash: p.hash } : null;
+  }
+  return null;
+}
+
+/** `child` names `parent` as its issuer (the issuer Name, byte for byte). */
+const issuedBy = (child, parent) => equal(child.issuerRaw, parent.subjectRaw);
+
+/** `parent`'s key signed `child`. */
+function signedBy(child, parent) {
+  // verifySignature answers false, never throws — the guard is for a certificate this reader misread.
+  try {
+    const s = signatureScheme(child.sigAlg, child.sigParams);
+    return !!s && verifySignature({ ...s, spki: parent.spki, data: child.tbs, signature: child.signature });
+  } catch {
+    return false;
+  }
+}
+
+return { parseCertificate, readPemCertificates, RSA_PSS, signatureScheme, issuedBy, signedBy };
+})();
+M.zip = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Minimal zero-dependency ZIP reader — STORED (method 0) only.
+ *
+ * Reads the dossier archives Azoth produces, which are always
+ * STORED (uncompressed). We parse the End-of-Central-Directory record, walk the
+ * central directory, and slice each file's raw bytes out of its local header.
+ * A DEFLATE decoder is intentionally omitted — the writer never compresses, and
+ * a decompressor would be another dependency the auditor must trust.
+ */
+
+const U16 = (dv, o) => dv.getUint16(o, true);
+const U32 = (dv, o) => dv.getUint32(o, true);
+
+/**
+ * @param {Uint8Array} bytes  the whole .zip file
+ * @returns {Record<string, Uint8Array>}  path → file bytes
+ */
+function readZip(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  // Locate the End of Central Directory record (signature 0x06054b50), scanning
+  // back from the end (there is no trailing comment in our archives).
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= 0; i--) {
+    if (U32(dv, i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('not a zip archive (no end-of-central-directory record)');
+
+  const total = U16(dv, eocd + 10);
+  let p = U32(dv, eocd + 16); // central directory offset
+
+  const out = {};
+  const dec = new TextDecoder();
+  for (let n = 0; n < total; n++) {
+    if (U32(dv, p) !== 0x02014b50) throw new Error('corrupt central directory');
+    const method   = U16(dv, p + 10);
+    const compSize = U32(dv, p + 20);
+    const nameLen  = U16(dv, p + 28);
+    const extraLen = U16(dv, p + 30);
+    const cmtLen   = U16(dv, p + 32);
+    const localOff = U32(dv, p + 42);
+    const name = dec.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+
+    if (method !== 0) throw new Error(`unsupported compression (method ${method}) for ${name} — verifier expects STORED`);
+
+    // Local header: read its own name/extra lengths (may differ from central).
+    if (U32(dv, localOff) !== 0x04034b50) throw new Error(`corrupt local header for ${name}`);
+    const lNameLen  = U16(dv, localOff + 26);
+    const lExtraLen = U16(dv, localOff + 28);
+    const dataStart = localOff + 30 + lNameLen + lExtraLen;
+    out[name] = bytes.subarray(dataStart, dataStart + compSize);
+
+    p += 46 + nameLen + extraLen + cmtLen;
+  }
+  return out;
+}
+
+return { readZip };
+})();
+M.chain = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * The chain's primitives (SPEC.md, Checks 1–3): the hash, the canonical form of a sealed core,
+ * an entry's hash, the manifest's root hash, a run of linked entries. Shared by every check —
+ * the dossier, decision, incident, compliance and platform packs, and receipts.
+ */
+const { digest } = M.crypto;
+const { bytesOf, hex } = M.bytes;
+
+/** sha256 hex of a string (UTF-8) or of bytes. */
+function sha256Hex(data) {
+  return hex(digest('sha256', bytesOf(data)));
+}
+
+/**
+ * Recursively sort object keys ascending, preserve array order, drop keys whose
+ * value is `undefined`. Mirrors the journal's `sortKeys`. (In JSON, undefined
+ * only appears via absent keys, so this is mostly key-ordering — but we honour
+ * the exact spec so the canonical string is identical.)
+ */
+function sortKeys(value) {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value).sort()) {
+      const v = value[k];
+      if (v !== undefined) out[k] = sortKeys(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** core_canonical = JSON.stringify(sortKeys(core)). */
+function canonicalCore(core) {
+  return JSON.stringify(sortKeys(core));
+}
+
+/** entry_hash = sha256(prev_hash || core_canonical) — plain concatenation, hex. */
+function computeEntryHash(prevHash, coreCanonical) {
+  return sha256Hex(prevHash + coreCanonical);
+}
+
+/** root_hash = sha256( sorted(file sha256 hex).join('') ). */
+function computeRootHash(files) {
+  return sha256Hex(files.map(f => f.sha256).sort().join(''));
+}
+
+const bySeq = (a, b) => a.seq - b.seq;
+
+/**
+ * Verify consecutive links: each entryHash recomputes from (prevHash, canonical),
+ * each prevHash is the previous entryHash, seqs follow each other. The first
+ * link starts the segment: at seq 1 its prevHash must be "" (genesis); later,
+ * it is where the segment attaches to the earlier chain.
+ */
+function verifyLinks(links) {
+  let prev = '';
+  for (let i = 0; i < links.length; i++) {
+    const l = links[i];
+    if (computeEntryHash(l.prevHash, l.canonical) !== l.entryHash) {
+      return { ok: false, brokenAt: l.seq, reason: 'entry_hash mismatch (row altered)', verified: i };
+    }
+    if (i === 0) {
+      if (l.seq === 1 && l.prevHash !== '') return { ok: false, brokenAt: l.seq, reason: 'the genesis entry must have an empty prev_hash', verified: i };
+    } else if (l.seq !== links[i - 1].seq + 1) {
+      return { ok: false, brokenAt: l.seq, reason: `seq gap after ${links[i - 1].seq} (entries missing from the segment)`, verified: i };
+    } else if (l.prevHash !== prev) {
+      return { ok: false, brokenAt: l.seq, reason: 'prev_hash break (row inserted/removed/reordered)', verified: i };
+    }
+    prev = l.entryHash;
+  }
+  return {
+    ok: true, brokenAt: null, reason: null, verified: links.length,
+    first: links[0]?.seq ?? null, last: links[links.length - 1]?.seq ?? null, startPrevHash: links[0]?.prevHash ?? null,
+  };
+}
+
+
+return { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, bySeq, verifyLinks };
+})();
+M.timestamp = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * azoth-verify — RFC 3161 trusted timestamp check (SPEC.md, Check 4).
+ *
+ * Zero dependencies, zero network, and no Azoth code: the DER reader (der.mjs),
+ * the certificate reader (x509.mjs) and the token checks below are written from
+ * SPEC.md and the RFCs (3161 time-stamp protocol, 5652 CMS, 5280 X.509), so a
+ * third party can verify a dossier's timestamp without trusting the producer —
+ * from the CLI (node:crypto) or the offline web page (crypto-web.mjs).
+ */
+const { tlv, items, oidOf, intOf, timeOf } = M.der;
+const { concat, equal, fromHex } = M.bytes;
+const { digest, verifySignature } = M.crypto;
+const { parseCertificate, readPemCertificates, signatureScheme, issuedBy, signedBy } = M.x509;
+
+// ── Token ────────────────────────────────────────────────────────────────────
+
+const HASHES = { '2.16.840.1.101.3.4.2.1': 'sha256', '2.16.840.1.101.3.4.2.2': 'sha384', '2.16.840.1.101.3.4.2.3': 'sha512' };
+const SIGNED_DATA = '1.2.840.113549.1.7.2';
+const TST_INFO = '1.2.840.113549.1.9.16.1.4';
+const CONTENT_TYPE = '1.2.840.113549.1.9.3';
+const MESSAGE_DIGEST = '1.2.840.113549.1.9.4';
+const TIME_STAMPING = '1.3.6.1.5.5.7.3.8';
+
+/** TimeStampResp (anchor.tsr) → the parts Check 4 needs. Throws on a malformed or refused response. */
+function readTimestampResponse(der) {
+  const [statusInfo, token] = items(tlv(der));
+  const status = Number(intOf(items(statusInfo)[0]));
+  if (status !== 0 && status !== 1) throw new Error(`the TSA refused the request (status ${status})`);
+  if (!token) throw new Error('no token in the response');
+  const [type, wrapped] = items(token);
+  if (oidOf(type) !== SIGNED_DATA) throw new Error('the token is not CMS SignedData');
+  const sd = items(items(wrapped)[0]);
+  const [eType, eWrapped] = items(sd[2]);
+  if (oidOf(eType) !== TST_INFO) throw new Error('the signed content is not a TSTInfo');
+  const tstInfo = items(eWrapped)[0].body;
+  const certs = [];
+  let signerInfos = null;
+  for (const n of sd.slice(3)) {
+    if (n.tag === 0xa0) for (const c of items(n)) if (c.tag === 0x30) certs.push(parseCertificate(c.whole));
+    if (n.tag === 0x31) signerInfos = n;
+  }
+  if (!signerInfos) throw new Error('no SignerInfo');
+  const si = items(items(signerInfos)[0]);
+  const sidSerial = si[1].tag === 0x30 ? intOf(items(si[1])[1]) : null;
+  let i = 3;
+  const signedAttrs = si[i]?.tag === 0xa0 ? si[i++] : null;
+  const t = items(tlv(tstInfo));
+  const [imAlg, imHash] = items(t[2]);
+  return {
+    tstInfo,
+    imprintAlg: oidOf(items(imAlg)[0]),
+    imprint: imHash.body,
+    genTime: timeOf(t[4]),
+    digestAlg: oidOf(items(si[2])[0]),
+    signedAttrs,
+    sigAlg: oidOf(items(si[i])[0]),
+    sigParams: items(si[i])[1] ?? null,
+    signature: si[i + 1].body,
+    sidSerial,
+    certs,
+  };
+}
+
+function signatureHolds(t, cert) {
+  const hash = HASHES[t.digestAlg];
+  if (!hash) return false;
+  let input = t.tstInfo;
+  if (t.signedAttrs) {
+    const attrs = items(t.signedAttrs);
+    const find = id => attrs.find(a => oidOf(items(a)[0]) === id);
+    const md = find(MESSAGE_DIGEST);
+    const ct = find(CONTENT_TYPE);
+    if (!md || !ct || oidOf(items(items(ct)[1])[0]) !== TST_INFO) return false;
+    const want = items(items(md)[1])[0].body;
+    if (!equal(digest(hash, t.tstInfo), want)) return false;
+    // RFC 5652 §5.4: the signature covers the attributes DER-encoded as a SET (tag 0x31).
+    input = concat(Uint8Array.of(0x31), t.signedAttrs.whole.subarray(1));
+  }
+  const s = signatureScheme(t.sigAlg, t.sigParams, hash);
+  // The digest algorithm of the SignerInfo is the signature's hash (RFC 5652 §5.4); RSASSA-PSS
+  // parameters must name the same one (RFC 4056 §2).
+  if (!s || (s.scheme === 'rsa-pss' && s.hash !== hash)) return false;
+  return verifySignature({ scheme: s.scheme, hash: s.scheme === 'ed25519' ? null : hash, spki: cert.spki, data: input, signature: t.signature });
+}
+
+/** PEM bundle → certificates. */
+const readPem = readPemCertificates;
+
+/**
+ * Check 4: does `tsr` (anchor.tsr bytes) timestamp exactly `rootHashHex`, under a
+ * valid TSA signature — and does its chain end on a certificate in `pinned`?
+ * `shipped` = the certificates the dossier itself carries (tsa-chain.pem).
+ * @returns {{ ok: boolean, detail: string, genTime?: Date, tsa?: string, trusted?: boolean, root?: string }}
+ */
+function checkTimestamp(tsr, rootHashHex, { shipped = [], pinned = null } = {}) {
+  let t;
+  try { t = readTimestampResponse(tsr); } catch (err) { return { ok: false, detail: `anchor.tsr unreadable: ${err.message}` }; }
+  let want;
+  try { want = fromHex(rootHashHex); } catch { want = new Uint8Array(0); }
+  if (t.imprintAlg !== '2.16.840.1.101.3.4.2.1' || !equal(t.imprint, want)) {
+    return { ok: false, detail: 'the timestamp does not cover this manifest root_hash' };
+  }
+  const pool = [...t.certs, ...shipped, ...(pinned ?? [])];
+  const signer = pool.find(c => t.sidSerial !== null && c.serial === t.sidSerial)
+    ?? pool.find(c => { try { return signatureHolds(t, c); } catch { return false; } });
+  if (!signer) return { ok: false, detail: 'no certificate for the TSA signer' };
+  let holds = false;
+  try { holds = signatureHolds(t, signer); } catch { holds = false; }
+  if (!holds) return { ok: false, detail: 'invalid TSA signature' };
+  if (!signer.eku.includes(TIME_STAMPING)) return { ok: false, detail: 'the signer is not a time-stamping certificate' };
+  if (t.genTime < signer.notBefore || t.genTime > signer.notAfter) {
+    return { ok: false, detail: 'genTime outside the signer certificate validity' };
+  }
+  const isPinned = c => !!pinned?.some(p => p.fingerprint256 === c.fingerprint256);
+  let cert = signer;
+  let trusted = isPinned(cert);
+  for (let depth = 0; !trusted && depth < 8; depth++) {
+    if (issuedBy(cert, cert) && signedBy(cert, cert)) break;
+    const up = pool.find(c => c.fingerprint256 !== cert.fingerprint256 && issuedBy(cert, c) && signedBy(cert, c));
+    if (!up) return { ok: false, detail: 'incomplete certificate chain for the TSA' };
+    cert = up;
+    trusted = isPinned(cert);
+  }
+  const tsa = signer.subject.replace(/\n/g, ', ');
+  return { ok: true, genTime: t.genTime, tsa, trusted, root: cert.subject.replace(/\n/g, ', '), detail: `signed by ${tsa} at ${t.genTime.toISOString()}` };
+}
+
+return { readTimestampResponse, readPem, checkTimestamp };
+})();
+M.incident = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 7 — an incident dossier (`evidence.json` kind "incident", SPEC.md).
+ *
+ * Like the rest of the verifier, this shares nothing with Azoth's code: the
+ * scope predicate below is reimplemented from SPEC.md, not imported.
+ */
+const { sha256Hex, canonicalCore, computeEntryHash, verifyLinks } = M.chain;
+const { checkTimestamp } = M.timestamp;
+
+const bySeq = (a, b) => a.seq - b.seq;
+const policyOf = e => (e?.core?.policy && typeof e.core.policy === 'object' ? e.core.policy : {});
+
+/**
+ * Does a sealed entry fall in the scope? Over the sealed core only, plus the
+ * capture time for a window (the `occurredAt` column, which the hash does not
+ * cover). Every criterion present must hold.
+ */
+function matchesScope(core, occurredAt, scope) {
+  const c = core ?? {};
+  if (c.surface === 'governance' && !(scope.refusalDecisions ?? []).includes(String(c.decision ?? ''))) return false;
+  for (const k of ['model', 'modelVersion', 'policyVersion', 'agentId', 'mandateVersion', 'usecaseId']) {
+    if (scope[k] !== undefined && c[k] !== scope[k]) return false;
+  }
+  if (scope.tool !== undefined && !(Array.isArray(c.tools) && c.tools.some(t => t?.name === scope.tool))) return false;
+  if (scope.dataSource !== undefined) {
+    const ds = scope.dataSource;
+    if (!(Array.isArray(c.dataSources) && c.dataSources.some(d => d?.type === ds.type && (ds.id === undefined || d?.id === ds.id)))) return false;
+  }
+  const t = Date.parse(occurredAt);
+  if (scope.from !== undefined && !(t >= Date.parse(scope.from))) return false;
+  if (scope.to !== undefined && !(t < Date.parse(scope.to))) return false;
+  return true;
+}
+
+/** @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>} */
+function verifyIncidentPack(pack, files, { shipped = [], pinned = null } = {}) {
+  const out = [];
+  const push = (id, ok, detail, level) => out.push(level ? { id, ok, detail, level } : { id, ok, detail });
+  const segments = Array.isArray(pack.segments) ? pack.segments : [];
+  const entries = Array.isArray(pack.entries) ? [...pack.entries].sort(bySeq) : [];
+
+  // 1. The incident's actions: recomputed, naming the incident, inside a verified segment.
+  const at = new Map();
+  let broken = null;
+  for (const seg of segments) {
+    const links = [...(seg.links ?? [])].sort(bySeq);
+    const v = verifyLinks(links.map(l => ({ seq: l.seq, prevHash: l.prevHash, entryHash: l.entryHash, canonical: l.coreCanonical })));
+    if (!v.ok) { broken ??= `${v.reason} at seq ${v.brokenAt}`; continue; }
+    if (links[0]?.seq !== seg.fromSeq || links[links.length - 1]?.seq !== seg.toSeq) broken ??= `segment ${seg.fromSeq}–${seg.toSeq} does not hold its declared range`;
+    for (const l of links) at.set(l.seq, l);
+  }
+  for (const e of entries) {
+    if (broken) break;
+    const p = policyOf(e);
+    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (action altered) at seq ${e.seq}`;
+    else if (e.core?.surface !== 'governance' || !String(e.core?.decision ?? '').startsWith('incident_')) broken = `entry ${e.seq} is not an incident action`;
+    else if (p.incidentId !== pack.incidentId || p.scopeHash !== pack.scopeHash) broken = `entry ${e.seq} does not name this incident and its scope`;
+    else {
+      const l = at.get(e.seq);
+      if (!l || l.entryHash !== e.entryHash || l.prevHash !== e.prevHash) broken = `entry ${e.seq} is not in a verified chain segment`;
+    }
+  }
+  push('incident.actions', !broken && entries.length > 0, broken ?? (entries.length ? `${entries.length} sealed actions, in ${segments.length} verified chain segment(s)` : 'no sealed action'));
+
+  for (const seg of segments) {
+    if (!seg.anchor) continue;
+    const last = at.get(seg.toSeq);
+    const tsr = files[seg.anchor.file];
+    if (!tsr || !last) { push(`incident.anchor.${seg.toSeq}`, false, `${seg.anchor.file} missing`); continue; }
+    const t = checkTimestamp(tsr, last.entryHash, { shipped, pinned });
+    if (!t.ok) push(`incident.anchor.${seg.toSeq}`, false, `journal head ${seg.toSeq}: ${t.detail}`);
+    else if (pinned) push(`incident.anchor.${seg.toSeq}`, t.trusted, t.trusted ? `actions up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} (${t.tsa})` : 'the TSA chain does not end on the root given with --tsa-root');
+    else push(`incident.anchor.${seg.toSeq}`, true, `actions up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} — pin the TSA's root with --tsa-root to trust it`, 'warn');
+  }
+  if (!segments.some(s => s.anchor)) push('incident.anchor', true, 'no segment ends on a timestamped journal head: the actions are linked, not dated by a third party', 'warn');
+
+  // 2. Order: steps 1…n, once each, in the journal's order.
+  const steps = entries.map(e => policyOf(e).incidentStep);
+  const sorted = [...steps].sort((a, b) => a - b);
+  const contiguous = sorted.every((s, i) => s === i + 1);
+  push('incident.order', contiguous, contiguous ? `steps 1–${steps.length}, each once` : `steps are not 1…${steps.length} (${sorted.join(', ')}): an action is missing or duplicated`);
+  if (contiguous && steps.some((s, i) => s !== i + 1)) push('incident.order.journal', true, 'some actions were sealed after later ones (through the outbox): their step says where they belong', 'warn');
+
+  // 3. Scope: sealed by the declaration.
+  const declaration = entries.find(e => policyOf(e).incidentStep === 1);
+  const sealedScope = policyOf(declaration).scope;
+  const scopeOk = declaration?.core?.decision === 'incident_declared' && typeof sealedScope === 'string'
+    && sealedScope === canonicalCore(pack.scope) && sha256Hex(sealedScope) === pack.scopeHash;
+  push('incident.scope', scopeOk, scopeOk ? `the scope is the one declared at step 1 (sha256 ${pack.scopeHash.slice(0, 12)}…)` : 'the scope does not match the one sealed by the declaration');
+
+  // 4. Impact: the matched set hashes to the last sealed one.
+  const impacts = entries.filter(e => e.core?.decision === 'incident_scoped').sort((a, b) => policyOf(a).incidentStep - policyOf(b).incidentStep);
+  const sealed = policyOf(impacts[impacts.length - 1]);
+  const impact = pack.impact ?? {};
+  const listed = Array.isArray(impact.decisions) ? impact.decisions : null;
+  let inList = null;
+  if (!impacts.length) {
+    push('incident.impact', true, 'the impact has not been sealed yet', 'warn');
+  } else if (!listed) {
+    push('incident.impact', true, `${sealed.matched} matched decisions sealed (hash ${String(sealed.setHash).slice(0, 12)}…); their list is not in this dossier`, 'warn');
+  } else {
+    const ordered = listed.every((d, i) => i === 0 || d.seq > listed[i - 1].seq) && listed.every(d => d.seq <= sealed.throughSeq);
+    const ok = ordered && listed.length === sealed.matched && sha256Hex(listed.map(d => d.entryHash).join('\n')) === sealed.setHash;
+    push('incident.impact', ok, ok ? `${listed.length} matched decisions up to seq ${sealed.throughSeq}: the set sealed at step ${sealed.incidentStep}` : 'the matched decisions do not hash to the sealed set');
+    inList = new Map(listed.map(d => [d.seq, d.entryHash]));
+  }
+
+  // 5. The matched entries shipped in full: recomputed, in the set, in the scope.
+  const shown = Array.isArray(impact.entries) ? impact.entries : [];
+  let bad = null;
+  for (const e of shown) {
+    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) bad = `matched entry ${e.seq} altered`;
+    else if (inList && inList.get(e.seq) !== e.entryHash) bad = `entry ${e.seq} is not in the sealed matched set`;
+    else if (!matchesScope(e.core, e.occurredAt, pack.scope)) bad = `entry ${e.seq} does not match the scope`;
+    if (bad) break;
+  }
+  if (shown.length) push('incident.matched', !bad, bad ?? `${shown.length} matched entries recomputed, each in the set and in the scope${impact.entriesTruncated ? ' (the first ones only)' : ''}`);
+
+  // 6. Completeness: over the whole journal up to the impact's last seq, the scope matches exactly the set.
+  const links = Array.isArray(impact.completeness?.links) ? [...impact.completeness.links].sort(bySeq) : null;
+  if (links && impacts.length && inList) {
+    const v = verifyLinks(links.map(l => ({ seq: l.seq, prevHash: l.prevHash, entryHash: l.entryHash, canonical: l.coreCanonical })));
+    let why = !v.ok ? `${v.reason} at seq ${v.brokenAt}` : links[0]?.seq !== 1 || links[links.length - 1]?.seq !== sealed.throughSeq ? `the journal shipped is not seq 1–${sealed.throughSeq}` : null;
+    if (!why) {
+      const found = links.filter(l => matchesScope(JSON.parse(l.coreCanonical), l.occurredAt, pack.scope)).map(l => [l.seq, l.entryHash]);
+      const same = found.length === inList.size && found.every(([s, h]) => inList.get(s) === h);
+      if (!same) why = `the scope matches ${found.length} entries of the journal, the sealed set holds ${inList.size}`;
+    }
+    push('incident.completeness', !why, why ?? `the whole journal up to seq ${sealed.throughSeq} read again: no other sealed decision matches the scope`);
+  } else if (impacts.length) {
+    push('incident.completeness', true, 'the journal is not shipped (too long): completeness rests on the producer; the set is committed by its sealed hash', 'warn');
+  }
+
+  // 7. Report drafts: each file is the one sealed.
+  for (const e of entries.filter(x => x.core?.decision === 'incident_report_drafted')) {
+    const p = policyOf(e);
+    const file = pack.reports?.[p.draftId]?.file;
+    if (!file || !files[file]) { push(`incident.report.${String(p.draftId).slice(0, 8)}`, true, `report draft ${String(p.draftId).slice(0, 8)} sealed, not in this dossier`, 'warn'); continue; }
+    const ok = sha256Hex(files[file]) === p.sha256;
+    push(`incident.report.${String(p.draftId).slice(0, 8)}`, ok, ok ? `${file} is the draft sealed at step ${p.incidentStep}` : `${file} does not hash to the sealed draft`);
+  }
+  return out;
+}
+
+return { matchesScope, verifyIncidentPack };
+})();
+M.compliance = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 8 — a compliance bundle (`evidence.json` kind "compliance", SPEC.md).
+ *
+ * The bundle says which requirements of a framework are covered by sealed
+ * evidence. This check makes that claim verifiable: the framework file (its
+ * requirements and the predicates of its evidence kinds) hashes to what the
+ * bundle names, every cited entry recomputes and matches the predicate of the
+ * kind it is cited for, and no requirement is marked covered unless each of its
+ * required groups has such an entry. Like the rest of the verifier it shares
+ * nothing with Azoth's code: the predicate rule is reimplemented from SPEC.md.
+ */
+const { sha256Hex, canonicalCore, computeEntryHash, verifyLinks } = M.chain;
+const { checkTimestamp } = M.timestamp;
+
+const bySeq = (a, b) => a.seq - b.seq;
+
+/** Does a sealed core count as evidence of this kind? (SPEC.md, Check 8, "Predicates".) */
+function matchesKind(kind, core) {
+  if (!kind || kind.source !== 'journal' || !core || typeof core !== 'object') return false;
+  const m = kind.match ?? {};
+  if (core.surface !== m.surface) return false;
+  const decision = typeof core.decision === 'string' ? core.decision : '';
+  const decisions = Array.isArray(m.decisions) ? m.decisions : [];
+  const prefixes = Array.isArray(m.decisionPrefixes) ? m.decisionPrefixes : [];
+  if ((decisions.length || prefixes.length) && !(decisions.includes(decision) || prefixes.some(p => decision.startsWith(p)))) return false;
+  const policy = core.policy && typeof core.policy === 'object' ? core.policy : {};
+  for (const [key, rule] of Object.entries(m.policy ?? {})) {
+    const v = policy[key];
+    if (rule && 'present' in rule ? v === undefined || v === null : v !== rule?.eq) return false;
+  }
+  for (const f of m.corePresent ?? []) if (core[f] === undefined || core[f] === null) return false;
+  return true;
+}
+
+function verifyCompliancePack(pack, files, { shipped = [], pinned = null } = {}) {
+  const out = [];
+  const push = (id, ok, detail, level) => out.push(level ? { id, ok, detail, level } : { id, ok, detail });
+  const dec = new TextDecoder();
+
+  // 1. The framework document the statuses were computed against.
+  let doc = null;
+  const fwBytes = files[pack.framework?.file];
+  if (!fwBytes) push('compliance.framework', false, `${pack.framework?.file ?? 'framework file'} missing`);
+  else if (sha256Hex(fwBytes) !== pack.framework.sha256) push('compliance.framework', false, `${pack.framework.file} does not hash to the framework hash the bundle names`);
+  else {
+    try { doc = JSON.parse(dec.decode(fwBytes)); } catch { doc = null; }
+    if (!doc?.framework || doc.framework.id !== pack.framework.id) { push('compliance.framework', false, 'the framework file is not the framework the bundle names'); doc = null; }
+    else push('compliance.framework', true, `${doc.framework.id} ${doc.framework.version}: ${doc.framework.requirements.length} requirements, the evidence kinds and every text, hashed`);
+  }
+  if (doc?.framework.mappingStatus !== 'validated') push('compliance.mapping', true, 'the mapping to the framework is marked as still to be validated by an expert', 'warn');
+  const disclaimed = typeof pack.disclaimer?.en === 'string' && pack.disclaimer.en.length > 0 && typeof pack.disclaimer?.fr === 'string' && pack.disclaimer.fr.length > 0;
+  push('compliance.disclaimer', disclaimed, disclaimed ? 'the bundle states it is a tool to prepare an audit, not a certification or legal advice' : 'the bundle carries no disclaimer');
+
+  // 2. The cited entries: recomputed, inside verified chain segments.
+  const segments = Array.isArray(pack.segments) ? pack.segments : [];
+  const entries = Array.isArray(pack.entries) ? [...pack.entries].sort(bySeq) : [];
+  const individual = pack.integrity?.inclusion === 'individual';
+  const at = new Map();
+  let broken = null;
+  for (const seg of segments) {
+    const links = [...(seg.links ?? [])].sort(bySeq);
+    const v = verifyLinks(links.map(l => ({ seq: l.seq, prevHash: l.prevHash, entryHash: l.entryHash, canonical: l.coreCanonical })));
+    if (!v.ok) { broken ??= `${v.reason} at seq ${v.brokenAt}`; continue; }
+    if (links[0]?.seq !== seg.fromSeq || links[links.length - 1]?.seq !== seg.toSeq) broken ??= `segment ${seg.fromSeq}–${seg.toSeq} does not hold its declared range`;
+    for (const l of links) at.set(l.seq, l);
+  }
+  const verified = new Map();
+  for (const e of entries) {
+    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) { broken ??= `entry_hash mismatch (cited entry altered) at seq ${e.seq}`; continue; }
+    const l = at.get(e.seq);
+    if (!individual && (!l || l.entryHash !== e.entryHash || l.prevHash !== e.prevHash)) { broken ??= `entry ${e.seq} is not in a verified chain segment`; continue; }
+    verified.set(e.seq, e);
+  }
+  push('compliance.chain', !broken, broken ?? `${verified.size} cited sealed entries${individual ? ', each verified on its own' : `, in ${segments.length} verified chain segment(s)`}`);
+
+  for (const seg of segments) {
+    if (!seg.anchor) continue;
+    const last = at.get(seg.toSeq);
+    const tsr = files[seg.anchor.file];
+    if (!tsr || !last) { push(`compliance.anchor.${seg.toSeq}`, false, `${seg.anchor.file} missing`); continue; }
+    const t = checkTimestamp(tsr, last.entryHash, { shipped, pinned });
+    if (!t.ok) push(`compliance.anchor.${seg.toSeq}`, false, `journal head ${seg.toSeq}: ${t.detail}`);
+    else if (pinned) push(`compliance.anchor.${seg.toSeq}`, t.trusted, t.trusted ? `entries up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} (${t.tsa})` : 'the TSA chain does not end on the root given with --tsa-root');
+    else push(`compliance.anchor.${seg.toSeq}`, true, `entries up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} — pin the TSA's root with --tsa-root to trust it`, 'warn');
+  }
+
+  // 3. Timestamped journal heads cited as evidence.
+  const heads = new Set();
+  for (const h of Array.isArray(pack.heads) ? pack.heads : []) {
+    const link = at.get(h.journalSeq);
+    const tsr = files[h.file];
+    if (!link || !tsr) { push(`compliance.head.${h.journalSeq}`, false, `head ${h.journalSeq}: ${tsr ? 'its link is not in the bundle' : `${h.file} missing`}`); continue; }
+    const t = checkTimestamp(tsr, link.entryHash, { shipped, pinned });
+    if (!t.ok) { push(`compliance.head.${h.journalSeq}`, false, `head ${h.journalSeq}: ${t.detail}`); continue; }
+    heads.add(h.journalSeq);
+  }
+
+  if (!doc) return out;
+  const kinds = new Map((doc.kinds ?? []).map(k => [k.id, k]));
+  const reqs = new Map(doc.framework.requirements.map(r => [r.id, r]));
+  const listed = Array.isArray(pack.requirements) ? pack.requirements : [];
+
+  // 4. Every citation is evidence of the kind it is cited for.
+  const valid = new Map();   // kind id → number of valid citations, per requirement key
+  let bad = null;
+  for (const r of listed) {
+    for (const [kindId, ev] of Object.entries(r.evidence ?? {})) {
+      const k = kinds.get(kindId);
+      const cited = Array.isArray(ev?.cited) ? ev.cited : [];
+      if (!k) { bad ??= `${r.id}: kind ${kindId} is not in the framework file`; continue; }
+      if (k.source === 'external' && (cited.length || ev.sealed)) { bad ??= `${r.id}: ${kindId} is what only the organisation provides — it cannot be counted as sealed`; continue; }
+      if (cited.length > (ev.sealed ?? 0)) { bad ??= `${r.id}: more ${kindId} entries cited than counted`; continue; }
+      let n = 0;
+      for (const seq of cited) {
+        if (k.source === 'anchor') { if (heads.has(seq)) n++; else bad ??= `${r.id}: head ${seq} cited as ${kindId} is not a verified timestamped head`; continue; }
+        const e = verified.get(seq);
+        if (!e) bad ??= `${r.id}: entry ${seq} cited as ${kindId} is not a verified entry of the bundle`;
+        else if (!matchesKind(k, e.core)) bad ??= `${r.id}: entry ${seq} is not evidence of ${kindId}`;
+        else n++;
+      }
+      valid.set(`${r.id}\u0000${kindId}`, n);
+    }
+  }
+  push('compliance.citations', !bad, bad ?? 'every cited entry is evidence of the kind it is cited for');
+
+  // 5. No requirement is covered without evidence for each required group.
+  let inflated = null;
+  const missingReq = [...reqs.keys()].filter(id => !listed.some(r => r.id === id));
+  if (missingReq.length) inflated = `requirements left out of the bundle: ${missingReq.join(', ')}`;
+  const counts = { covered: 0, partial: 0, not_covered: 0, out_of_scope: 0 };
+  for (const r of listed) {
+    const req = reqs.get(r.id);
+    if (!req) { inflated ??= `${r.id} is not a requirement of the framework`; continue; }
+    counts[r.status] = (counts[r.status] ?? 0) + 1;
+    const groupHas = g => g.some(kindId => (valid.get(`${r.id}\u0000${kindId}`) ?? 0) > 0);
+    if (r.status === 'covered' && !req.required.every(groupHas)) inflated ??= `${r.id} is marked covered without verified evidence for each required group`;
+    if (r.status === 'out_of_scope' && r.reason === 'declared_out_of_scope') {
+      const s = (pack.scope ?? []).find(x => x.requirementId === r.id);
+      const e = s?.seq != null ? verified.get(s.seq) : null;
+      const p = e?.core?.policy ?? {};
+      const ok = e && e.core.surface === 'governance' && e.core.decision === 'compliance_scope_declared'
+        && p.requirementId === r.id && p.frameworkId === pack.framework.id && p.justificationHash === s.justificationHash;
+      if (!ok) inflated ??= `${r.id} is declared out of scope without its sealed declaration`;
+    }
+    if (r.status === 'out_of_scope' && r.reason === 'not_applicable' && !(req.applicability === 'high_risk' && pack.context?.highRiskUseCases === 0)) {
+      inflated ??= `${r.id} is marked not applicable, which its framework does not allow here`;
+    }
+  }
+  push('compliance.coverage', !inflated, inflated ?? `${counts.covered} requirement(s) covered, each on cited sealed evidence for every required group`);
+  if (listed.some(r => r.reason === 'not_applicable')) push('compliance.applicability', true, 'requirements marked not applicable rest on the registry count the producer states (no high-risk use case declared)', 'warn');
+
+  // 6. The summary recomputes from the statuses.
+  const applicable = listed.length - counts.out_of_scope;
+  const s = pack.summary ?? {};
+  const rate = applicable ? counts.covered / applicable : 0;
+  const summaryOk = s.total === listed.length && s.covered === counts.covered && s.partial === counts.partial && s.notCovered === counts.not_covered
+    && s.outOfScope === counts.out_of_scope && s.applicable === applicable && Math.abs((s.rate ?? -1) - rate) < 1e-9;
+  push('compliance.summary', summaryOk, summaryOk ? `${counts.covered} covered / ${applicable} applicable (${Math.round(rate * 100)} %)` : 'the summary does not recompute from the requirements');
+  return out;
+}
+
+return { matchesKind, verifyCompliancePack };
+})();
+M.platform = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 9 — an Azoth platform evidence package (`evidence.json` kind "platform",
+ * SPEC.md): one month of Azoth's OWN journal — its deployments, restore drills,
+ * staff access, break-glass, access reviews, platform admin grants — handed to
+ * Azoth's auditor. The month's segment must be intact, attach where the package
+ * says (the previous month's last link, or the genesis), hold no entry dated after
+ * the month, and its counts per event type must recompute from it. Like the rest
+ * of the verifier it shares nothing with Azoth's code.
+ */
+const { canonicalCore, verifyLinks } = M.chain;
+
+const bySeq = (a, b) => a.seq - b.seq;
+const day = (s) => Date.parse(`${s}T00:00:00Z`);
+
+function verifyPlatformPack(pack) {
+  const out = [];
+  const push = (id, ok, detail, level) => out.push(level ? { id, ok, detail, level } : { id, ok, detail });
+
+  const from = day(pack?.period?.from), to = day(pack?.period?.to);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+    push('platform.period', false, 'the period is not a valid date range');
+    return out;
+  }
+  if (!Array.isArray(pack.chain)) {
+    push('platform.chain', false, 'evidence.json has no chain');
+    return out;
+  }
+  const chain = [...pack.chain].sort(bySeq);
+
+  // 1. Every link recomputes and follows the previous one.
+  const v = verifyLinks(chain.map(l => ({ seq: l.seq, prevHash: l.prevHash, entryHash: l.entryHash, canonical: l.coreCanonical })));
+  push('platform.chain', v.ok, v.ok
+    ? (chain.length ? `chain intact (${chain.length} sealed entries, seq ${v.first}–${v.last})` : 'no entry sealed in the period')
+    : `${v.reason} at seq ${v.brokenAt}`);
+  if (!v.ok) return out;
+
+  // 2. The seam: where this month's segment attaches.
+  const prev = pack.previous ?? null;
+  if (prev && (typeof prev.toSeq !== 'number' || typeof prev.entryHash !== 'string')) {
+    push('platform.seam', false, '`previous` must name a seq and an entry hash');
+  } else if (!chain.length) {
+    push('platform.seam', true, prev ? `nothing sealed after seq ${prev.toSeq}` : 'empty, from the genesis');
+  } else if (prev) {
+    const ok = chain[0].seq === prev.toSeq + 1 && chain[0].prevHash === prev.entryHash;
+    push('platform.seam', ok, ok
+      ? `attaches to seq ${prev.toSeq} (${prev.entryHash.slice(0, 12)}…) — compare with the previous month's package`
+      : 'the first entry does not follow the `previous` link the package names');
+  } else {
+    const ok = chain[0].seq === 1 && chain[0].prevHash === '';
+    push('platform.seam', ok, ok ? 'starts at the genesis of the journal' : 'without `previous`, the segment must start at the genesis (seq 1)');
+  }
+
+  // 3. Canonical cores, none dated after the period.
+  let canonBad = null, late = null;
+  const counts = {};
+  for (const l of chain) {
+    let core;
+    try { core = JSON.parse(l.coreCanonical); } catch { canonBad = l.seq; break; }
+    if (canonicalCore(core) !== l.coreCanonical) { canonBad = l.seq; break; }
+    const at = Date.parse(core.occurredAt);
+    if (late === null && !(Number.isFinite(at) && at < to)) late = l.seq;
+    counts[core.act] = (counts[core.act] ?? 0) + 1;
+  }
+  push('platform.canonical', canonBad === null, canonBad === null ? 'every core is in canonical form' : `the core at seq ${canonBad} is not in canonical form`);
+  if (canonBad !== null) return out;
+  push('platform.dates', late === null, late === null ? `no entry dated after ${pack.period.to}` : `the entry at seq ${late} is dated at or after the end of the period`);
+
+  // 4. The counts the package states.
+  const stated = pack.counts && typeof pack.counts === 'object' ? pack.counts : {};
+  const keys = new Set([...Object.keys(counts), ...Object.keys(stated)]);
+  const same = [...keys].every(k => counts[k] === stated[k]);
+  push('platform.counts', same, same ? `the counts per event type recompute (${keys.size} types)` : 'the counts per event type do not recompute from the chain');
+
+  // 5. What the verifier cannot check.
+  if (pack.snapshot) push('platform.snapshot', true, 'the snapshot (platform admins, serving commit…) is stated by Azoth when it generated the package, not sealed — not verified', 'warn');
+  return out;
+}
+
+return { verifyPlatformPack };
+})();
+M.jurisdiction = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 11 — each decision's applicable law, decided again (SPEC.md). A decision
+ * seals the facts its law was decided from (where the people are, the operator, where the model
+ * ran, the data, the mandate's evidence and zones, the day), the packs that covered it and the
+ * sha256 of their documents, and the deciding rule. The dossier ships those documents
+ * (`jurisdiction-packs.json`). From the seal and the documents alone, this module selects the packs
+ * again, keeps the rules in force on the day, and applies the strictest unmet requirement — so a
+ * third party sees, without trusting Azoth, that the rule sealed is the one the packs call for.
+ *
+ * Its own copy of the producer's engine: it imports nothing from Azoth. A parity test in the
+ * producer's repository keeps the two identical — change both or neither.
+ */
+const { sha256Hex } = M.chain;
+
+const PACKS_FILE = 'jurisdiction-packs.json';
+const EFFECTS = ['allow', 'reroute', 'approval', 'block'];
+
+// The same geography as the producer's zones.
+const EU = ['AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE'];
+const GROUPS = { EU, EEA: [...EU, 'IS', 'LI', 'NO', 'EU'] };
+
+function within(zone, ref) {
+  if (zone === ref || zone.startsWith(`${ref}-`)) return true;
+  const members = GROUPS[ref];
+  if (!members) return false;
+  return members.includes(zone.split('-')[0]) || members.includes(zone);
+}
+const withinAny = (zone, refs) => refs.some(r => within(zone, r));
+const someWithin = (zones, refs) => zones.some(z => withinAny(z, refs));
+function intersect(a, b) {
+  const out = new Set();
+  for (const x of a) for (const y of b) { if (within(x, y)) out.add(x); else if (within(y, x)) out.add(y); }
+  return [...out];
+}
+
+function expand(zones, lists) {
+  if (!zones) return undefined;
+  return zones.flatMap(z => (z.startsWith('@') ? lists[z.slice(1)] ?? [] : [z]));
+}
+
+function compileCondition(c, lists) {
+  return {
+    subjectIn: expand(c.subjectIn, lists), operatorIn: expand(c.operatorIn, lists), nexusIn: expand(c.nexusIn, lists),
+    sectorAny: c.sectorAny, dataAny: c.dataAny, aiActClass: c.aiActClass, automatedDecision: c.automatedDecision, populationAny: c.populationAny,
+  };
+}
+
+/** A pack document's pack, readied: zone lists expanded, provisions indexed. */
+function compilePack(pack) {
+  const lists = pack.zoneLists ?? {};
+  return {
+    pack, ref: `${pack.id}@${pack.version}`,
+    provisions: new Map((pack.provisions ?? []).map(p => [p.id, p])),
+    scope: compileCondition(pack.scope ?? {}, lists),
+    rules: (pack.rules ?? []).map(rule => ({
+      rule, ref: `${pack.id}/${rule.id}`, when: compileCondition(rule.when ?? {}, lists),
+      hostingIn: rule.require.kind === 'hosting' ? expand(rule.require.hostingIn, lists) ?? [] : null,
+      mechanisms: rule.require.kind === 'hosting' ? (rule.require.mechanisms ?? []).map(m => ({ id: m.id, hostingIn: expand(m.hostingIn, lists) ?? null })) : [],
+    })),
+  };
+}
+
+function holds(c, f) {
+  if (c.subjectIn && (!f.subjectZones.length || !someWithin(f.subjectZones, c.subjectIn))) return false;
+  if (c.operatorIn && (!f.operatorZones.length || !someWithin(f.operatorZones, c.operatorIn))) return false;
+  if (c.nexusIn && !someWithin(f.operatorZones, c.nexusIn) && !someWithin(f.subjectZones, c.nexusIn)) return false;
+  if (c.sectorAny && !f.sectors.some(s => c.sectorAny.includes(s))) return false;
+  if (c.dataAny && !f.dataCategories.some(d => c.dataAny.includes(d))) return false;
+  if (c.aiActClass && (!f.aiActClass || !c.aiActClass.includes(f.aiActClass))) return false;
+  if (c.automatedDecision !== undefined && f.automatedDecision !== c.automatedDecision) return false;
+  if (c.populationAny && (!f.population || !c.populationAny.includes(f.population))) return false;
+  return true;
+}
+
+function inForce(p, id, date) {
+  const prov = p.provisions.get(id);
+  return !!prov && prov.status === 'adopted' && prov.effectiveFrom <= date && (!prov.effectiveUntil || date < prov.effectiveUntil);
+}
+
+function hostingMet(zone, hostingIn, mechanisms, declared) {
+  for (const m of mechanisms) {
+    if (!declared.includes(m.id)) continue;
+    if (!m.hostingIn || (zone && withinAny(zone, m.hostingIn))) return true;
+  }
+  return !!zone && withinAny(zone, hostingIn);
+}
+
+function evidenceMet(f, id, maxAgeDays) {
+  const done = f.evidence[id];
+  if (!done || done > f.date) return false;
+  if (maxAgeDays === undefined) return true;
+  const oldest = new Date(Date.parse(`${f.date}T00:00:00Z`) - maxAgeDays * 86_400_000).toISOString().slice(0, 10);
+  return done >= oldest;
+}
+
+const rank = e => EFFECTS.indexOf(e);
+
+/**
+ * Decide again: the packs covering the facts, and the strictest unmet requirement the law calls for.
+ * `adopted`: the standards the decision named; `allowed`: the mandate's zones; `conflictRules`: those it applied.
+ */
+function decideAgain(packs, f, { adopted = new Set(), allowed = [], conflictRules = [] } = {}) {
+  const candidates = [];
+  const unmet = [];
+  const strict = [];
+  for (const p of packs) {
+    if (p.pack.kind === 'standard' && !adopted.has(p.ref)) continue;
+    if (!holds(p.scope, f)) continue;
+    candidates.push(p.ref);
+    for (const r of p.rules) {
+      if (!inForce(p, r.rule.provision, f.date) || !holds(r.when, f)) continue;
+      const req = r.rule.require;
+      let met;
+      if (req.kind === 'hosting') {
+        if (!r.mechanisms.length) strict.push({ ref: r.ref, zones: r.hostingIn, zone: p.pack.zone });
+        met = hostingMet(f.hostingZone, r.hostingIn, r.mechanisms, f.mechanisms);
+      } else if (req.kind === 'provider_registered') met = f.providerRegistered;
+      else if (req.kind === 'evidence') met = evidenceMet(f, req.evidence, req.maxAgeDays);
+      else met = false;
+      if (!met) unmet.push({ rule: r.ref, effect: r.rule.effect, reason: r.rule.reason });
+    }
+  }
+  if (allowed.length) {
+    strict.push({ ref: 'mandate/allowed_zones', zones: allowed, zone: null });
+    if (!hostingMet(f.hostingZone, allowed, [], [])) unmet.push({ rule: 'mandate/allowed_zones', effect: 'reroute', reason: 'outside_mandate_zones' });
+  }
+  const meet = list => list.slice(1).reduce((acc, s) => intersect(acc, s.zones), list[0]?.zones ?? []);
+  let conflict = null;
+  if (strict.length > 1 && !meet(strict).length) {
+    let kept = strict;
+    for (const c of conflictRules) {
+      const loser = c.zones[0] === c.prevails ? c.zones[1] : c.zones[0];
+      if (!kept.some(s => s.zone === c.prevails) || !kept.some(s => s.zone === loser)) continue;
+      kept = kept.filter(s => s.zone !== loser);
+    }
+    if (!(kept.length < strict.length && (kept.length < 2 || meet(kept).length))) {
+      conflict = strict.map(s => s.ref);
+      unmet.unshift({ rule: conflict[0], effect: 'block', reason: 'incompatible_requirements' });
+    }
+  }
+  const verdict = unmet.reduce((best, u) => (rank(u.effect) > rank(best.effect) ? u : best), { rule: null, effect: 'allow', reason: null });
+  return { packs: candidates, verdict, conflict };
+}
+
+/** A seal's factors as the engine reads them. */
+function factorsOf(s, day) {
+  const f = s.factors ?? {};
+  return {
+    subjectZones: f.subject ?? [], operatorZones: f.operator ?? [], hostingZone: f.hosting ?? null, provider: f.provider ?? '',
+    sectors: f.sector ?? [], dataCategories: f.data ?? [], aiActClass: f.aiAct ?? null, automatedDecision: f.automated === true,
+    population: f.population ?? null, mechanisms: f.mechanisms ?? [], providerRegistered: f.registered === true,
+    evidence: f.evidence ?? {}, date: f.date ?? day,
+  };
+}
+
+const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/**
+ * Check 11 over the dossier's listed entries. Entries without a sealed law are not concerned; a v1
+ * seal (the seal's first version, without the day) is checked by its packs' hash only; a v2 seal
+ * is decided again.
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>}
+ */
+function verifyJurisdiction(entries, files) {
+  const sealed = (entries ?? []).filter(e => e?.core?.jurisdiction && !e.core.jurisdiction.unavailable);
+  if (!sealed.length) return [];
+  const raw = files[PACKS_FILE];
+  if (!raw) return [{ id: 'jurisdiction', ok: true, level: 'warn', detail: `${sealed.length} decisions carry their applicable law, but the dossier ships no ${PACKS_FILE}: it cannot be decided again` }];
+  let doc;
+  try { doc = JSON.parse(new TextDecoder().decode(raw)); } catch { doc = null; }
+  if (!doc || doc.format !== 'azoth.jurisdiction.packs/1' || !Array.isArray(doc.packs)) return [{ id: 'jurisdiction', ok: false, detail: `${PACKS_FILE} is not a pack document list` }];
+
+  const hashes = new Map();
+  const compiled = [];
+  for (const p of doc.packs) {
+    let parsed = null;
+    try { parsed = JSON.parse(p.document); } catch { parsed = null; }
+    const pack = parsed?.format === 'azoth.jurisdiction.pack/1' ? parsed.pack : null;
+    if (!pack || sha256Hex(p.document) !== p.sha256 || `${pack.id}@${pack.version}` !== p.ref) {
+      return [{ id: 'jurisdiction', ok: false, detail: `the pack document ${p.ref} does not match its sha256 or its ref` }];
+    }
+    hashes.set(p.ref, p.sha256);
+    compiled.push(compilePack(pack));
+  }
+
+  let decided = 0, hashedOnly = 0, unshipped = 0;
+  for (const e of sealed) {
+    const s = e.core.jurisdiction;
+    const refs = s.packs ?? [];
+    if (refs.some(r => !hashes.has(r))) { unshipped++; continue; }
+    const set = sha256Hex([...refs].sort().map(r => `${r}:${hashes.get(r)}`).join('\n'));
+    if (set !== s.packSet) return [{ id: 'jurisdiction', ok: false, detail: `seq ${e.seq}: the packs it names do not hash to its sealed packSet` }];
+    if (s.v !== 2) { hashedOnly++; continue; }
+    const day = typeof e.occurredAt === 'string' ? e.occurredAt.slice(0, 10) : '';
+    const adopted = new Set(refs.filter(r => compiled.find(c => c.ref === r)?.pack.kind === 'standard'));
+    const conflictRules = (s.conflictRules ?? []).map(x => { const [a, b] = String(x).split('>'); return { zones: [a, b], prevails: a }; });
+    const again = decideAgain(compiled, factorsOf(s, day), { adopted, allowed: s.factors?.allowed ?? [], conflictRules });
+    const sealedVerdict = { rule: s.rule ?? null, effect: s.effect ?? 'allow', reason: s.reason ?? null };
+    if (!same(again.packs, refs)) return [{ id: 'jurisdiction', ok: false, detail: `seq ${e.seq}: its facts select ${again.packs.join(', ') || 'no pack'}, not the packs it sealed` }];
+    if (!same(again.verdict, sealedVerdict)) {
+      return [{ id: 'jurisdiction', ok: false, detail: `seq ${e.seq}: decided again, the strictest rule is ${again.verdict.rule ?? 'none'} (${again.verdict.effect}), not the sealed ${sealedVerdict.rule ?? 'none'} (${sealedVerdict.effect})` }];
+    }
+    if (!same(again.conflict, s.conflict)) return [{ id: 'jurisdiction', ok: false, detail: `seq ${e.seq}: the conflict decided again differs from the sealed one` }];
+    decided++;
+  }
+  const out = [{ id: 'jurisdiction', ok: true, detail: `${decided} decisions decided again from their sealed facts and the shipped packs: the same laws and the same strictest rule${hashedOnly ? `; ${hashedOnly} older seals checked by their packs' hash only` : ''}` }];
+  if (unshipped) out.push({ id: 'jurisdiction.packs', ok: true, level: 'warn', detail: `${unshipped} decisions name a pack version the dossier does not ship: not decided again` });
+  return out;
+}
+
+return { PACKS_FILE, compilePack, decideAgain, verifyJurisdiction };
+})();
+M.litigation = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 12, a litigation dossier (`evidence.json` kind "litigation", SPEC.md): beyond the chain
+ * checks a decision dossier gets (verify.mjs verifyDecisionPack), the hold's designation —
+ * `hold.entriesHash` is the sha256 of `hold.seqs` (ascending, comma-joined), every designated
+ * decision is listed, and the `legal_hold_placed` entry sealed that same hash when the hold was
+ * placed: the hold designated exactly these decisions then.
+ *
+ * Zero dependencies, no Azoth code: the rules are SPEC.md's, reimplemented here.
+ */
+const { sha256Hex } = M.chain;
+
+/** @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>} */
+function verifyHoldDesignation(pack) {
+  const hold = pack?.hold ?? {};
+  const seqs = Array.isArray(hold.seqs) ? hold.seqs.map(Number) : [];
+  const out = [];
+  const hash = sha256Hex([...seqs].sort((a, b) => a - b).join(','));
+  if (hash !== hold.entriesHash) out.push({ id: 'litigation.designation', ok: false, detail: 'hold.entriesHash is not the sha256 of hold.seqs' });
+  const listed = new Set((Array.isArray(pack?.entries) ? pack.entries : []).map(e => Number(e.seq)));
+  const missing = seqs.filter(s => !listed.has(s));
+  if (missing.length) out.push({ id: 'litigation.complete', ok: false, detail: `designated decisions not in the dossier: ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? '…' : ''}` });
+  else out.push({ id: 'litigation.complete', ok: true, detail: `the ${seqs.length} designated decisions are all in the dossier` });
+  if (hash !== hold.entriesHash) return out;
+  const placed = (Array.isArray(pack?.entries) ? pack.entries : []).find(e => e?.core?.decision === 'legal_hold_placed' && e?.core?.policy?.holdId === hold.id);
+  if (!placed) out.push({ id: 'litigation.designation', ok: true, level: 'warn', detail: 'the act that placed the hold is not in the dossier: the designation is not tied to a sealed entry' });
+  else if (placed.core.policy.entriesHash !== hold.entriesHash) out.push({ id: 'litigation.designation', ok: false, detail: `the hold sealed at seq ${placed.seq} designated other decisions` });
+  else out.push({ id: 'litigation.designation', ok: true, detail: `the hold sealed at seq ${placed.seq} designated exactly these ${seqs.length} decisions` });
+  return out;
+}
+
+return { verifyHoldDesignation };
+})();
+M.signature = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 12 — the dossier's signature (SPEC.md): `signature.jws`, a compact JWS (EdDSA) by the
+ * workspace's Ed25519 key (Azoth's platform key, for a platform package) over the manifest's
+ * root_hash, outside the manifest. It is REQUIRED: without it nothing binds the content to a key,
+ * and whoever handed the dossier over could have removed entries and recomputed the manifest.
+ *
+ * The key must be one the reader pinned (`--keys`, the keys the producer publishes): a key the
+ * dossier ships vouches only for itself, so a signature under it alone fails. From format 2 the
+ * signed claims also commit what the dossier covers — its kind, the chain's head at export, the
+ * count and range of the entries it lists, the filters of the export — and evidence.json must
+ * match them.
+ *
+ * Zero dependencies, zero network, no Azoth code: the rules are SPEC.md's, reimplemented here;
+ * the cryptography is crypto.mjs's (node:crypto, or the web verifier's).
+ */
+const { base64url, fromBase64, fromUtf8, utf8 } = M.bytes;
+const { digest, verifyEd25519 } = M.crypto;
+const { keyTrustAt } = M.keys;
+
+const SIGNATURE_FILE = 'signature.jws';
+const TYP = 'azoth-dossier+jws';
+const B64URL = /^[A-Za-z0-9_-]+$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+const DOSSIER_KINDS = ['audit', 'decision', 'incident', 'compliance', 'litigation', 'regulator', 'risk_profile', 'exhaustion', 'ai_footprint', 'platform'];
+const json = part => JSON.parse(fromUtf8(fromBase64(part)));
+const isSeq = v => Number.isInteger(v) && v >= 1;
+const isScalar = v => v === null || ['string', 'number', 'boolean'].includes(typeof v);
+
+/** The kind of a pack: its `kind`, or `audit` for a journal export (it has none). */
+const kindOf = pack => (typeof pack?.kind === 'string' ? pack.kind : 'audit');
+
+/** What a pack lists: its entries — a platform package's chain links. Count, first and last seq. */
+function coverageOf(pack) {
+  const listed = kindOf(pack) === 'platform' ? pack?.chain : pack?.entries;
+  const seqs = (Array.isArray(listed) ? listed : []).map(e => Number(e?.seq)).filter(Number.isFinite);
+  return { count: seqs.length, first: seqs.length ? Math.min(...seqs) : null, last: seqs.length ? Math.max(...seqs) : null };
+}
+
+/** Every sealed link a pack carries, wherever it sits: [{ seq, entryHash }]. */
+function carried(pack) {
+  const out = [];
+  const add = list => { for (const l of Array.isArray(list) ? list : []) out.push({ seq: Number(l?.seq), entryHash: l?.entryHash }); };
+  add(pack?.entries); add(pack?.chain);
+  for (const s of Array.isArray(pack?.segments) ? pack.segments : []) add(s?.links);
+  add(pack?.impact?.entries); add(pack?.impact?.completeness?.links);
+  return out;
+}
+
+const range = c => (c.count ? (c.first === c.last ? `seq ${c.first}` : `seq ${c.first}–${c.last}`) : 'nothing');
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+function wellFormedV2(c) {
+  const e = c?.entries;
+  const head = c?.head;
+  return DOSSIER_KINDS.includes(c?.kind)
+    && (head === null || (head && isSeq(head.seq) && HEX64.test(String(head.hash))))
+    && e && Number.isInteger(e.count) && e.count >= 0
+    && (e.count === 0 ? e.first === null && e.last === null : isSeq(e.first) && isSeq(e.last) && e.first <= e.last)
+    && c.filters && typeof c.filters === 'object' && !Array.isArray(c.filters) && Object.values(c.filters).every(isScalar);
+}
+
+/**
+ * Format 2: what the signature committed, against evidence.json. FAILs when the pack does not hold
+ * what was signed; else one PASS line saying plainly what the dossier covers.
+ */
+function verifyCoverage(claims, pack) {
+  const push = (ok, detail, id = 'coverage') => [{ id, ok, detail }];
+  const kind = kindOf(pack);
+  if (claims.kind !== kind) return push(false, `the signature is for a ${claims.kind} dossier; evidence.json is a ${kind} dossier`);
+  const got = coverageOf(pack);
+  const want = claims.entries;
+  if (got.count !== want.count || got.first !== want.first || got.last !== want.last) {
+    return push(false, `evidence.json lists ${plural(got.count, 'entry', 'entries')} (${range(got)}); the signature committed ${plural(want.count, 'entry', 'entries')} (${range(want)}) — entries were removed, added or renumbered after signing`);
+  }
+  const links = carried(pack).filter(l => Number.isFinite(l.seq));
+  const head = claims.head;
+  if (!head) {
+    if (links.length) return push(false, `the signature says the journal was empty at export, but the dossier carries seq ${links[0].seq}`);
+  } else {
+    const after = links.find(l => l.seq > head.seq);
+    if (after) return push(false, `the dossier carries seq ${after.seq}, after the chain's head the signature committed (seq ${head.seq})`);
+    const atHead = links.find(l => l.seq === head.seq && l.entryHash !== head.hash);
+    if (atHead) return push(false, `the entry at seq ${head.seq} is not the chain's head the signature committed (${head.hash.slice(0, 12)}…)`);
+  }
+  const journal = kind === 'platform' ? 'Azoth’s platform journal' : 'the workspace’s journal';
+  const what = got.count ? `lists ${plural(got.count, 'sealed entry', 'sealed entries')}, ${range(got)}` : 'lists no sealed entry';
+  const later = head && got.count && head.seq > got.last ? ` — nothing sealed after seq ${got.last} is in it (${plural(head.seq - got.last, 'later entry', 'later entries')})` : '';
+  const at = head ? `the head of ${journal} was seq ${head.seq} (${head.hash.slice(0, 12)}…) when it was exported${later}` : `${journal} was empty when it was exported`;
+  // Keys in code-point order: the same line whatever order the producer wrote them in.
+  const f = Object.entries(claims.filters).filter(([, v]) => v !== null && v !== '').sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return push(true, `${what}; ${at}; filters: ${f.length ? f.map(([k, v]) => `${k}=${v}`).join(', ') : 'none'}`);
+}
+
+/**
+ * @param {Record<string, Uint8Array>} files the dossier's files
+ * @param {string} rootHash the manifest's root_hash
+ * @param {{ keys?: { keys?: unknown[] } | null, pack?: unknown }} [opts] `keys`: the keys the reader pinned;
+ *   `pack`: the parsed evidence.json, for the coverage the signature commits
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>}
+ */
+function verifyDossierSignature(files, rootHash, { keys = null, pack = null } = {}) {
+  const fail = detail => [{ id: 'signature', ok: false, detail }];
+  const platform = kindOf(pack) === 'platform';
+  const raw = files[SIGNATURE_FILE];
+  if (!raw) {
+    return fail(`the dossier is unsigned (no ${SIGNATURE_FILE}): nothing binds its content to ${platform ? 'Azoth’s platform key' : 'the workspace’s key'}, so it cannot be trusted — entries removed and the manifest recomputed would go unnoticed`);
+  }
+  const parts = fromUtf8(raw).trim().split('.');
+  if (parts.length !== 3 || !parts.every(p => B64URL.test(p))) return fail(`${SIGNATURE_FILE} is not a compact JWS`);
+  let header; let claims;
+  try { header = json(parts[0]); claims = json(parts[1]); } catch { return fail(`${SIGNATURE_FILE}: header or claims are not JSON`); }
+  if (header?.alg !== 'EdDSA' || header?.typ !== TYP || typeof header?.kid !== 'string') return fail(`${SIGNATURE_FILE}: header must be { alg: "EdDSA", typ: "${TYP}", kid }`);
+  if (![1, 2].includes(claims?.v) || typeof claims?.ws !== 'string' || !HEX64.test(String(claims?.root)) || !Number.isInteger(claims?.iat)) {
+    return fail(`${SIGNATURE_FILE}: claims must be { v: 1 | 2, ws, root: sha256 hex, iat: seconds, … }`);
+  }
+  if (claims.v === 2 && !wellFormedV2(claims)) return fail(`${SIGNATURE_FILE}: format 2 claims must carry kind, head ({ seq, hash } or null), entries ({ count, first, last }) and filters (scalars)`);
+  if (claims.root !== rootHash) return fail('the signature bears on another root_hash than this manifest’s');
+  if (typeof pack?.workspaceId === 'string' && pack.workspaceId !== claims.ws) return fail(`signed for workspace ${claims.ws}, but evidence.json is workspace ${pack.workspaceId}’s`);
+  if (platform && claims.ws !== 'platform') return fail('a platform package is signed by Azoth’s platform key (claims ws "platform")');
+
+  const published = platform ? 'the platform keys Azoth publishes (/api/proof/platform-keys)' : `the keys Azoth publishes for this workspace (/api/proof/keys/${claims.ws})`;
+  let jwks = keys;
+  const shipped = !jwks;
+  if (shipped) {
+    try { jwks = files['keys.jwks.json'] ? JSON.parse(fromUtf8(files['keys.jwks.json'])) : null; } catch { jwks = null; }
+  }
+  const key = (Array.isArray(jwks?.keys) ? jwks.keys : []).find(k => k?.kid === header.kid);
+  if (!key || key.kty !== 'OKP' || key.crv !== 'Ed25519' || typeof key.x !== 'string') {
+    return fail(`no Ed25519 key ${header.kid} among ${shipped ? `the dossier’s keys.jwks.json — and none was pinned: give ${published} with --keys` : 'the keys given'}`);
+  }
+  // The kid is the key's RFC 7638 thumbprint: a key cannot be swapped under the same id.
+  const thumbprint = base64url(digest('sha256', utf8(JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: key.x }))));
+  if (thumbprint !== header.kid) return fail(`key ${header.kid} does not hash to its id`);
+  let valid = false;
+  try { valid = verifyEd25519(key.x, utf8(`${parts[0]}.${parts[1]}`), fromBase64(parts[2])); } catch { valid = false; }
+  if (!valid) return fail('the signature does not verify (dossier altered, or another key)');
+  const when = new Date(claims.iat * 1000).toISOString();
+  if (shipped) {
+    // A key the dossier ships vouches only for itself: anyone can rebuild a dossier and sign it with a key of their own.
+    return fail(`signed on ${when} by key ${header.kid.slice(0, 12)}…, which only the dossier itself vouches for — whoever handed it over could have rebuilt and re-signed it. Give ${published} with --keys`);
+  }
+  // A key its producer declared compromised signs nothing trusted from that instant on (keys.mjs, keyTrustAt).
+  const trust = keyTrustAt(key, claims.iat);
+  if (!trust.ok) return fail(`key ${header.kid.slice(0, 12)}… is refused: ${trust.detail}`);
+  const out = [{ id: 'signature', ok: true, detail: `signed by ${platform ? 'Azoth’s platform key' : 'the workspace’s key'} ${header.kid.slice(0, 12)}… on ${when}, among the keys given` }];
+  if (trust.warn) out.push({ id: 'signature.key', ok: true, level: 'warn', detail: `key ${header.kid.slice(0, 12)}…: ${trust.warn}` });
+  if (claims.v === 1) {
+    out.push({ id: 'coverage', ok: true, level: 'warn', detail: 'signed in format 1: the signature binds every file, but does not state the chain’s head at export nor the export’s filters' });
+  } else {
+    out.push(...verifyCoverage(claims, pack));
+  }
+  return out;
+}
+
+return { SIGNATURE_FILE, DOSSIER_KINDS, kindOf, coverageOf, verifyDossierSignature };
+})();
+M.pricing = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 13 — each decision's cost, recomputed from its sealed price (SPEC.md).
+ * An inference decision that carries tokens seals `core.pricing`: where its price came from (`src`),
+ * the unit prices in USD per 1M tokens (`in`, `out`), the prompt-cache multipliers when the call
+ * used the cache, and the EUR→USD rate (`eurUsd`). From the seal alone, this module recomputes the
+ * cost and holds it equal to the sealed `costEur`; a model without a price is sealed at 0, never a
+ * guess. When the dossier ships the catalog versions (`model-catalog.json`), each document must hash
+ * to its sha256, and a price sealed from a catalog version must be that version's price — its cache
+ * read multiple too, when the version gives a cached-input price (or 0.1, the multiple sealed before
+ * one was read).
+ *
+ * Its own copy of the producer's formulas (`costEurOf`, `cacheReadMultiple`): it imports nothing
+ * from Azoth. A parity test in the producer's repository keeps them identical — change both or
+ * neither.
+ */
+const { sha256Hex } = M.chain;
+const { base64url, fromBase64, fromUtf8, utf8 } = M.bytes;
+const { digest, verifyEd25519 } = M.crypto;
+
+const CATALOG_FILE = 'model-catalog.json';
+/**
+ * The public halves of the keys that sign Azoth's model catalog — the same as the producer pins,
+ * copied (the verifier imports nothing from Azoth). Empty until the key is made: a version is then
+ * shown as carrying no signature this verifier can check.
+ */
+const CATALOG_SIGNING_KEYS = [];
+const PRICED = ['catalog', 'matrix', 'declared'];
+const SOURCES = [...PRICED, 'none', 'cache', 'provider', 'reported'];
+
+const round8 = x => Math.round(x * 1e8) / 1e8;
+const close = (a, b) => Math.abs(a - b) <= 1e-12 + 1e-9 * Math.max(Math.abs(a), Math.abs(b));
+const n = v => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+const finite = v => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+
+/** The EUR cost a sealed price makes of the sealed tokens. */
+function costEurOf(p, t) {
+  let usd = round8((t.tokensIn / 1_000_000) * p.in + (t.tokensOut / 1_000_000) * p.out);
+  if (t.cacheReadTokens || t.cacheWriteTokens) usd = round8(usd + (t.cacheReadTokens * (p.cacheRead ?? 0) + t.cacheWriteTokens * (p.cacheWrite ?? 0)) / 1_000_000 * p.in);
+  return usd / p.eurUsd;
+}
+
+/** The cache read multiple every seal carried before the catalog's cached-input price was read. */
+const LEGACY_CACHE_READ = 0.1;
+
+/** A catalog entry's prompt-cache read as a multiple of its input price: cached ÷ in, to 1e-12; 0.1 without a cached price. */
+function cacheReadOf(at) {
+  if (typeof at.cached !== 'number' || !(at.in > 0)) return LEGACY_CACHE_READ;
+  return Math.round((at.cached / at.in) * 1e12) / 1e12;
+}
+
+const B64URL = /^[A-Za-z0-9_-]+$/;
+const kidOf = x => base64url(digest('sha256', utf8(JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x }))));
+
+/** A version's signature by Azoth's catalog key: 'verified', 'unsigned', 'unpinned' (no key to check with) or 'invalid'. */
+function catalogSignatureStatus(jws, version, sha256, keys = CATALOG_SIGNING_KEYS) {
+  if (typeof jws !== 'string' || !jws) return 'unsigned';
+  const parts = jws.split('.');
+  if (parts.length !== 3 || !parts.every(p => B64URL.test(p))) return 'invalid';
+  let header; let claims;
+  try { header = JSON.parse(fromUtf8(fromBase64(parts[0]))); claims = JSON.parse(fromUtf8(fromBase64(parts[1]))); } catch { return 'invalid'; }
+  if (header?.alg !== 'EdDSA' || header?.typ !== 'azoth-catalog+jws' || claims?.v !== 1 || claims?.catalog !== version || claims?.sha256 !== sha256) return 'invalid';
+  if (!keys.length) return 'unpinned';
+  const key = keys.find(k => kidOf(k.x) === header.kid);
+  if (!key) return 'invalid';
+  try { return verifyEd25519(key.x, utf8(`${parts[0]}.${parts[1]}`), fromBase64(parts[2])) ? 'verified' : 'invalid'; } catch { return 'invalid'; }
+}
+
+/** The shipped catalog versions: version → (provider\0model → { in, out, cached }); or an error detail. */
+function readCatalog(raw, keys) {
+  let doc;
+  try { doc = JSON.parse(new TextDecoder().decode(raw)); } catch { doc = null; }
+  if (!doc || doc.format !== 'azoth.model.catalog.versions/1' || !Array.isArray(doc.versions)) return { error: `${CATALOG_FILE} is not a list of catalog versions` };
+  const versions = new Map();
+  const signatures = new Map();
+  for (const v of doc.versions) {
+    let parsed = null;
+    try { parsed = JSON.parse(v.document); } catch { parsed = null; }
+    if (!parsed || parsed.format !== 'azoth.model.catalog/1' || parsed.version !== v.version || sha256Hex(v.document) !== v.sha256) {
+      return { error: `the catalog version ${v.version} does not match its sha256 or its number` };
+    }
+    const signature = catalogSignatureStatus(v.signature, v.version, v.sha256, keys);
+    if (signature === 'invalid') return { error: `the catalog version ${v.version} carries a signature that does not verify` };
+    const prices = new Map();
+    for (const e of parsed.entries ?? []) prices.set(`${e.provider}\u0000${e.model}`, { in: e.inputPer1M, out: e.outputPer1M, cached: e.cachedInputPer1M ?? null });
+    versions.set(v.version, prices);
+    signatures.set(v.version, signature);
+  }
+  return { versions, signatures };
+}
+
+function verifyPricing(entries, files, { keys = CATALOG_SIGNING_KEYS } = {}) {
+  const sealed = (entries ?? []).filter(e => e?.core?.pricing);
+  if (!sealed.length) return [];
+  const raw = files?.[CATALOG_FILE];
+  const catalog = raw ? readCatalog(raw, keys) : null;
+  if (catalog?.error) return [{ id: 'pricing', ok: false, detail: catalog.error }];
+
+  const count = Object.fromEntries(SOURCES.map(s => [s, 0]));
+  let unshipped = 0;
+  for (const e of sealed) {
+    const p = e.core.pricing;
+    const { src } = p;   // destructured: the web page's no-network test flags a property `src` followed by `=`
+    const cost = n(e.core.costEur);
+    if (p.v !== 1 || !SOURCES.includes(src)) return [{ id: 'pricing', ok: false, detail: `seq ${e.seq}: an unknown pricing seal (v ${p.v}, src ${src})` }];
+    if ((src === 'none' || src === 'cache') && cost !== 0) {
+      return [{ id: 'pricing', ok: false, detail: `seq ${e.seq}: ${src === 'none' ? 'no price' : 'a cached answer'}, yet a cost of ${cost} EUR was sealed` }];
+    }
+    if (PRICED.includes(src)) {
+      if (![p.in, p.out, p.eurUsd].every(finite) || !(p.eurUsd > 0)) return [{ id: 'pricing', ok: false, detail: `seq ${e.seq}: a ${src} price without its unit prices or rate` }];
+      const tokens = {
+        tokensIn: n(e.core.tokensIn), tokensOut: n(e.core.tokensOut),
+        cacheReadTokens: n(e.core.policy?.cacheReadTokens), cacheWriteTokens: n(e.core.policy?.cacheWriteTokens),
+      };
+      const again = costEurOf(p, tokens);
+      if (!close(again, cost)) return [{ id: 'pricing', ok: false, detail: `seq ${e.seq}: its tokens at its sealed price cost ${again} EUR, not the sealed ${cost}` }];
+      if (src === 'catalog') {
+        const prices = catalog?.versions.get(p.catalog);
+        const at = prices?.get(`${e.core.provider ?? ''}\u0000${p.key}`) ?? [...(prices?.entries() ?? [])].find(([k]) => k.endsWith(`\u0000${p.key}`))?.[1];
+        if (!prices) unshipped++;
+        else if (!at || at.in !== p.in || at.out !== p.out) return [{ id: 'pricing', ok: false, detail: `seq ${e.seq}: the price sealed for ${p.key} is not catalog version ${p.catalog}'s` }];
+        else if (p.cacheRead !== undefined && p.cacheRead !== cacheReadOf(at) && p.cacheRead !== LEGACY_CACHE_READ) {
+          return [{ id: 'pricing', ok: false, detail: `seq ${e.seq}: the cache read price sealed for ${p.key} is not catalog version ${p.catalog}'s` }];
+        }
+      }
+    }
+    count[src]++;
+  }
+  const said = SOURCES.filter(s => count[s]).map(s => `${count[s]} ${s}`).join(', ');
+  const out = [{ id: 'pricing', ok: true, detail: `${sealed.length} sealed costs recomputed from their sealed price (${said})` }];
+  if (unshipped) out.push({ id: 'pricing.catalog', ok: true, level: 'warn', detail: `${unshipped} prices name a catalog version the dossier does not ship (${CATALOG_FILE}): their arithmetic holds, the version itself is not shown` });
+  if (catalog) {
+    const by = s => [...catalog.signatures].filter(([, st]) => st === s).map(([v]) => v);
+    const verified = by('verified'), unchecked = [...by('unsigned'), ...by('unpinned')];
+    if (verified.length) out.push({ id: 'pricing.signature', ok: true, detail: `catalog versions ${verified.join(', ')} signed by Azoth's catalog key` });
+    if (unchecked.length) out.push({ id: 'pricing.signature', ok: true, level: 'warn', detail: `catalog versions ${unchecked.join(', ')} carry no signature this verifier can check: their prices are Azoth's word` });
+  }
+  return out;
+}
+
+return { CATALOG_FILE, CATALOG_SIGNING_KEYS, costEurOf, LEGACY_CACHE_READ, cacheReadOf, catalogSignatureStatus, verifyPricing };
+})();
+M.footprint = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 14 — an AI footprint statement (SPEC.md): a repository's findings as
+ * they were attested, frozen in the dossier. From them alone, this module recomputes their sha256 —
+ * the `sha:ruleId` lines sorted (ASCII) and joined with a newline — and the counts (findings, distinct
+ * commits declared, distinct commits with a marker, files), and holds both to `attestation` and to the
+ * sealed act `ai_footprint_attested` (its `core.policy`). A finding names a commit and a rule, never an
+ * author; a marker is never a proof.
+ *
+ * Its own copy of the producer's rule (`findingsHash`, `totalsOf`): it imports nothing from Azoth.
+ * A parity test in the producer's repository keeps the two identical — change both or neither.
+ */
+const { sha256Hex } = M.chain;
+
+const STRENGTHS = ['declared', 'marker', 'config'];
+
+const footprintHash = findings => sha256Hex(findings.map(f => `${f.sha}:${f.ruleId}`).sort().join('\n'));
+
+function footprintCounts(findings) {
+  const distinct = s => new Set(findings.filter(f => f.strength === s).map(f => f.sha)).size;
+  return { findings: findings.length, declared: distinct('declared'), markers: distinct('marker') };
+}
+
+function verifyFootprintPack(pack) {
+  const a = pack?.attestation;
+  if (!a || !Array.isArray(a.findings)) return [{ id: 'ai_footprint', ok: false, detail: 'evidence.json carries no attestation and its findings' }];
+  const bad = a.findings.find(f => !/^[0-9a-f]{40}$/.test(String(f?.sha)) || typeof f?.ruleId !== 'string' || !STRENGTHS.includes(f?.strength) || 'author' in f || 'authorHmac' in f);
+  if (bad) return [{ id: 'ai_footprint', ok: false, detail: `a finding is not a commit and a rule (${String(bad?.sha).slice(0, 12)}…), or names an author` }];
+  const hash = footprintHash(a.findings);
+  if (hash !== a.findingsHash) return [{ id: 'ai_footprint', ok: false, detail: 'the findings do not hash to the attestation’s findingsHash' }];
+  const counts = footprintCounts(a.findings);
+  const t = a.totals ?? {};
+  for (const k of ['findings', 'declared', 'markers']) {
+    if (t[k] !== counts[k]) return [{ id: 'ai_footprint', ok: false, detail: `the attestation counts ${t[k]} ${k}, its findings ${counts[k]}` }];
+  }
+  if (t.config !== (a.config ?? []).length) return [{ id: 'ai_footprint', ok: false, detail: 'the attestation’s file count is not its files' }];
+  const act = (pack.entries ?? []).find(e => e?.core?.decision === 'ai_footprint_attested' && e.core?.policy?.attestationId === a.id);
+  if (!act) return [{ id: 'ai_footprint', ok: false, detail: 'the dossier carries no sealed ai_footprint_attested act for this statement' }];
+  const p = act.core.policy;
+  if (p.findingsHash !== hash || p.findings !== counts.findings || p.declared !== counts.declared || p.markers !== counts.markers || p.config !== t.config) {
+    return [{ id: 'ai_footprint', ok: false, detail: `the sealed act (seq ${act.seq}) does not seal these findings and counts` }];
+  }
+  return [{ id: 'ai_footprint', ok: true, detail: `${counts.findings} findings over ${t.commitsScanned ?? '?'} commits read: ${counts.declared} commits declared, ${counts.markers} with a marker (never a proof), ${t.config} files — their fingerprint is the one sealed at seq ${act.seq}; no author named` }];
+}
+
+return { footprintHash, footprintCounts, verifyFootprintPack };
+})();
+M.retention = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 15 — the journal retention checkpoint (SPEC.md).
+ *
+ * A workspace's plan keeps its sealed journal for a limited time: the producer removes only the
+ * OLDEST contiguous prefix of the chain, and records where the kept chain starts — the last removed
+ * entry's seq and entry hash (a checkpoint), declared by a sealed act (`journal_retention_applied`)
+ * appended before the removal. The first kept entry's prevHash is that hash: a chain that starts
+ * there is the continuation of what was removed, not a cut.
+ *
+ * Reimplemented from SPEC.md; this module shares no code with the producer.
+ */
+const { bySeq } = M.chain;
+
+const HEX64 = /^[0-9a-f]{64}$/;
+const ACT = 'journal_retention_applied';
+const isSeq = v => Number.isInteger(v) && v >= 1;
+
+function parse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+/** Every link the pack carries — listed entries (their `core`), the `chain` of a filtered pack, the segments' links. */
+function linksOf(pack) {
+  const at = new Map();
+  const add = (seq, prevHash, entryHash, core) => { if (!at.has(seq)) at.set(seq, { seq, prevHash, entryHash, core }); };
+  for (const e of Array.isArray(pack?.entries) ? pack.entries : []) add(Number(e.seq), e.prevHash, e.entryHash, e.core ?? null);
+  for (const l of Array.isArray(pack?.chain) ? pack.chain : []) add(Number(l.seq), l.prevHash, l.entryHash, parse(l.coreCanonical));
+  for (const s of Array.isArray(pack?.segments) ? pack.segments : []) {
+    for (const l of Array.isArray(s?.links) ? s.links : []) add(Number(l.seq), l.prevHash, l.entryHash, parse(l.coreCanonical));
+  }
+  return [...at.values()].sort(bySeq);
+}
+
+const wellFormed = c => isSeq(c?.throughSeq) && HEX64.test(String(c?.throughHash ?? '')) && isSeq(c?.fromSeq) && c.fromSeq <= c.throughSeq
+  && c.removed === c.throughSeq - c.fromSeq + 1 && isSeq(c?.actSeq) && c.actSeq > c.throughSeq && HEX64.test(String(c?.actHash ?? ''));
+
+/**
+ * The retention checkpoint of a pack (`retention.checkpoints`), against the links it ships. Nothing is
+ * reported for a pack that ships no checkpoint and seals no retention act. Check 3 (or 5, 7, 8) has
+ * already verified each link's hash and the linkage; this check says where the kept chain starts.
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>}
+ */
+function verifyRetention(pack) {
+  const out = [];
+  const push = (id, ok, detail, level) => out.push(level ? { id, ok, detail, level } : { id, ok, detail });
+  const links = linksOf(pack);
+  const acts = links.filter(l => l.core?.decision === ACT);
+  const shipped = pack?.retention?.checkpoints;
+
+  if (!Array.isArray(shipped)) {
+    if (acts.length) push('retention', true, `${acts.length} journal retention act(s) sealed in the chain; no checkpoint shipped with this dossier`, 'warn');
+    return out;
+  }
+  if (!shipped.length || !shipped.every(wellFormed)) {
+    push('retention.checkpoint', false, 'a journal retention checkpoint is malformed (seqs, hashes or count)');
+    return out;
+  }
+  const latest = [...shipped].sort((a, b) => b.throughSeq - a.throughSeq)[0];
+  const first = links[0];
+
+  if (!first) {
+    push('retention.checkpoint', true, `entries 1–${latest.throughSeq} were removed under the journal retention; this dossier lists no entry`);
+  } else if (first.seq <= latest.throughSeq) {
+    push('retention.checkpoint', false, `the dossier holds entry ${first.seq}, in the prefix the checkpoint says was removed (through ${latest.throughSeq})`);
+  } else if (first.seq === latest.throughSeq + 1) {
+    const ok = first.prevHash === latest.throughHash;
+    push('retention.checkpoint', ok, ok
+      ? `the kept chain starts at seq ${first.seq}: entries 1–${latest.throughSeq} were removed under the journal retention, and the first kept entry links to the last removed one (${latest.throughHash.slice(0, 12)}…)`
+      : `entry ${first.seq} does not link to the retention checkpoint (prevHash ≠ the last removed entry's hash)`);
+  } else {
+    push('retention.checkpoint', true, `the segment starts at seq ${first.seq}, after the retention checkpoint (entries 1–${latest.throughSeq} removed): it attaches to the kept chain`);
+  }
+
+  // Each sealed act declares exactly the checkpoint shipped for it.
+  const byAct = new Map(shipped.map(c => [c.actSeq, c]));
+  for (const a of acts) {
+    const c = byAct.get(a.seq);
+    const p = a.core?.policy ?? {};
+    if (!c) { push(`retention.act.${a.seq}`, true, `the journal retention act at seq ${a.seq}: its checkpoint is not shipped with this dossier`, 'warn'); continue; }
+    const same = p.fromSeq === c.fromSeq && p.throughSeq === c.throughSeq && p.throughHash === c.throughHash && p.removed === c.removed && a.entryHash === c.actHash;
+    push(`retention.act.${a.seq}`, same, same
+      ? `the act at seq ${a.seq} sealed this removal before it took place (seqs ${c.fromSeq}–${c.throughSeq}, ${c.removed} entries)`
+      : `the act at seq ${a.seq} does not declare the checkpoint shipped for it`);
+  }
+  if (!links.some(l => l.seq === latest.actSeq)) {
+    push('retention.act', true, `the act that sealed the checkpoint (seq ${latest.actSeq}) is outside this dossier's entries: the checkpoint is shipped, its seal is not`, 'warn');
+  }
+  return out;
+}
+
+return { verifyRetention };
+})();
+M.verify = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * azoth-verify — independent verification core.
+ *
+ * Zero runtime dependencies, zero network. This file DELIBERATELY imports no
+ * Azoth application code: the value of an independent verifier is that it
+ * shares nothing with the producer. Its algorithms (here and in chain.mjs) are
+ * reimplemented from SPEC.md (which documents, but does not import, the
+ * producer's decision journal). A cross-import would annul the evidentiary value.
+ */
+const { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, verifyLinks, bySeq } = M.chain;
+const { checkTimestamp, readPem } = M.timestamp;
+const { verifyIncidentPack } = M.incident;
+const { verifyCompliancePack } = M.compliance;
+const { verifyPlatformPack } = M.platform;
+const { verifyJurisdiction } = M.jurisdiction;
+const { verifyPricing } = M.pricing;
+const { verifyFootprintPack } = M.footprint;
+const { verifyHoldDesignation } = M.litigation;
+const { verifyDossierSignature } = M.signature;
+const { verifyRetention } = M.retention;
+
+// The chain primitives, for callers of the verifier's main module (chain.mjs holds them).
+
+
+/**
+ * Verify the sealed decision chain in an evidence pack (SPEC.md, Check 3).
+ * With `pack.chain` (the listed entries were filtered), the whole segment is
+ * verified and every listed entry must be one of its links, unchanged.
+ * @returns {{ ok: boolean, brokenAt: number|null, reason: string|null, verified: number, first?: number|null, last?: number|null, startPrevHash?: string|null, listed?: number }}
+ */
+function verifyChain(pack) {
+  const listed = Array.isArray(pack?.entries) ? [...pack.entries].sort(bySeq) : [];
+  if (!Array.isArray(pack?.chain)) {
+    return verifyLinks(listed.map(e => ({ seq: e.seq, prevHash: e.prevHash, entryHash: e.entryHash, canonical: canonicalCore(e.core) })));
+  }
+  const links = [...pack.chain].sort(bySeq);
+  const seg = verifyLinks(links.map(l => ({ seq: l.seq, prevHash: l.prevHash, entryHash: l.entryHash, canonical: l.coreCanonical })));
+  if (!seg.ok) return seg;
+  const at = new Map(links.map(l => [l.seq, l]));
+  for (const e of listed) {
+    const l = at.get(e.seq);
+    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) {
+      return { ok: false, brokenAt: e.seq, reason: 'entry_hash mismatch (listed entry altered)', verified: seg.verified };
+    }
+    if (!l || l.entryHash !== e.entryHash || l.prevHash !== e.prevHash) {
+      return { ok: false, brokenAt: e.seq, reason: 'listed entry is not in the verified chain segment', verified: seg.verified };
+    }
+  }
+  return { ...seg, listed: listed.length };
+}
+
+/**
+ * Check 5 — a decision dossier (`evidence.json` kind "decision", SPEC.md): every
+ * listed entry recomputes, carries the dossier's decision-reference hash, and is
+ * a link of one of the chain segments; each segment verifies on its own; a
+ * segment that ends on a timestamped journal head is closed by its RFC 3161
+ * token; the rule sets and use-case snapshots named by the entries hash to their
+ * archived files.
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>}
+ */
+function verifyDecisionPack(pack, files, { shipped = [], pinned = null } = {}) {
+  const out = [];
+  // A litigation dossier (Check 12) is checked the same way; its entries are the hold's
+  // designated decisions and the hold's own acts, instead of one decision reference's calls.
+  // An exhaustion incident dossier (Check 12) too: its entries are the incident's own acts.
+  const litigation = pack.kind === 'litigation';
+  const exhaustion = pack.kind === 'exhaustion';
+  // An AI footprint statement (Check 14): its entry is the statement's own sealed act.
+  const footprint = pack.kind === 'ai_footprint';
+  const kind = litigation ? 'litigation' : exhaustion ? 'exhaustion' : footprint ? 'ai_footprint' : 'decision';
+  const held = new Set((litigation && Array.isArray(pack.hold?.seqs) ? pack.hold.seqs : []).map(Number));
+  const belongs = e => (litigation
+    ? held.has(Number(e.seq)) || (String(e.core?.decision ?? '').startsWith('legal_hold_') && e.core?.policy?.holdId === pack.hold?.id)
+    : exhaustion
+      ? String(e.core?.decision ?? '').startsWith('exhaustion_') && e.core?.policy?.incidentId === pack.incident?.id
+      : footprint
+        ? e.core?.decision === 'ai_footprint_attested' && e.core?.policy?.attestationId === pack.attestation?.id
+        : e.core?.decisionRefHash === pack.decisionRefHash);
+  const push = (id, ok, detail, level) => out.push(level ? { id: id.replace(/^decision\./, `${kind}.`), ok, detail, level } : { id: id.replace(/^decision\./, `${kind}.`), ok, detail });
+  const segments = Array.isArray(pack.segments) ? pack.segments : [];
+  const entries = Array.isArray(pack.entries) ? [...pack.entries].sort(bySeq) : [];
+
+  // Segments, then the entries in them.
+  let linkCount = 0;
+  const at = new Map();
+  let broken = null;
+  for (const seg of segments) {
+    const links = [...(seg.links ?? [])].sort(bySeq);
+    linkCount += links.length;
+    const v = verifyLinks(links.map(l => ({ seq: l.seq, prevHash: l.prevHash, entryHash: l.entryHash, canonical: l.coreCanonical })));
+    if (!v.ok) { broken ??= `${v.reason} at seq ${v.brokenAt}`; continue; }
+    if (links[0]?.seq !== seg.fromSeq || links[links.length - 1]?.seq !== seg.toSeq) broken ??= `segment ${seg.fromSeq}–${seg.toSeq} does not hold its declared range`;
+    for (const l of links) at.set(l.seq, l);
+  }
+  for (const e of entries) {
+    if (broken) break;
+    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (listed entry altered) at seq ${e.seq}`;
+    else if (!belongs(e)) broken = litigation ? `entry ${e.seq} is neither designated by this hold nor one of its acts`
+      : exhaustion ? `entry ${e.seq} is not an act of this exhaustion incident`
+        : footprint ? `entry ${e.seq} is not this AI footprint statement's act` : `entry ${e.seq} does not carry this dossier's decision reference`;
+    else {
+      const l = at.get(e.seq);
+      if (!l || l.entryHash !== e.entryHash || l.prevHash !== e.prevHash) broken = `entry ${e.seq} is not in a verified chain segment`;
+    }
+  }
+  const what = litigation ? 'entries (decisions under hold, and the hold’s acts)' : exhaustion ? 'acts of this exhaustion incident' : footprint ? 'the act of this AI footprint statement' : 'calls of this decision';
+  push('decision.chain', !broken, broken ?? `${entries.length} ${what}, in ${segments.length} verified chain segment(s) (${linkCount} links)`);
+
+  // Segments closed by a timestamped journal head.
+  for (const seg of segments) {
+    if (!seg.anchor) continue;
+    const last = at.get(seg.toSeq);
+    const tsr = files[seg.anchor.file];
+    if (!tsr || !last) { push(`decision.anchor.${seg.toSeq}`, false, `${seg.anchor.file} missing`); continue; }
+    const t = checkTimestamp(tsr, last.entryHash, { shipped, pinned });
+    if (!t.ok) push(`decision.anchor.${seg.toSeq}`, false, `journal head ${seg.toSeq}: ${t.detail}`);
+    else if (pinned) push(`decision.anchor.${seg.toSeq}`, t.trusted, t.trusted ? `entries up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} (${t.tsa})` : 'the TSA chain does not end on the root given with --tsa-root');
+    else push(`decision.anchor.${seg.toSeq}`, true, `entries up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} — pin the TSA's root with --tsa-root to trust it`, 'warn');
+  }
+  if (!segments.some(s => s.anchor)) {
+    push('decision.anchor', true, 'no segment ends on a timestamped journal head: the calls are linked, not dated by a third party', 'warn');
+  }
+
+  // The policy and the use case in force.
+  const named = (key, registry, label) => {
+    const hashes = [...new Set(entries.map(e => e.core?.[key]).filter(h => typeof h === 'string'))];
+    for (const h of hashes) {
+      const file = registry?.[h]?.file;
+      if (!file || !files[file]) { push(`decision.${label}.${h.slice(0, 12)}`, true, `${label} ${h.slice(0, 12)}… sealed, its text not archived in this dossier`, 'warn'); continue; }
+      const ok = sha256Hex(files[file]) === h;
+      push(`decision.${label}.${h.slice(0, 12)}`, ok, ok ? `${file} is the ${label} sealed by the calls` : `${file} does not hash to the sealed ${label}`);
+    }
+  };
+  named('policyVersion', pack.policies, 'policy');
+  named('usecaseSnapshotHash', pack.usecases, 'usecase');
+  if (litigation) out.push(...verifyHoldDesignation(pack));
+  return out;
+}
+
+/**
+ * Check 6 — client-vault content (SPEC.md). Each file the client supplies (a
+ * decrypted plaintext document, or the stored envelope) must hash to the
+ * plaintext or ciphertext hash of a sealed `vault_receipt` entry of the dossier.
+ * @param {Array<{ name: string, bytes: Uint8Array }>} contents
+ */
+function verifyVaultContents(pack, contents) {
+  const out = [];
+  const receipts = (Array.isArray(pack?.entries) ? pack.entries : []).filter(e => e?.core?.decision === 'vault_receipt');
+  for (const c of contents) {
+    const h = sha256Hex(c.bytes);
+    const asPlain = receipts.find(e => e.core?.policy?.vaultPlaintextHash === h);
+    const asCipher = asPlain ? null : receipts.find(e => e.core?.policy?.vaultCiphertextHash === h);
+    const hit = asPlain ?? asCipher;
+    out.push(hit
+      ? { id: `vault.${c.name}`, ok: true, detail: `${asPlain ? 'the plaintext' : 'the stored envelope'} sealed by the receipt at seq ${hit.seq} (trace ${hit.traceId ?? '?'})` }
+      : { id: `vault.${c.name}`, ok: false, detail: `no sealed receipt carries sha256 ${h.slice(0, 12)}… — altered, or not of this dossier` });
+  }
+  if (contents.length && !receipts.length) out.push({ id: 'vault', ok: false, detail: 'the dossier holds no vault receipt' });
+  return out;
+}
+
+/**
+ * An ISO 8601 instant (`2026-11-14T10:00:00.123Z`, `…123+00:00` as a database writes it) in
+ * microseconds since the epoch, or null when it is not one. Exact to the microsecond: the fraction is
+ * read as written, never through a float.
+ */
+function instantMicros(s) {
+  const m = typeof s === 'string' ? /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}(?::?\d{2})?)$/.exec(s) : null;
+  if (!m) return null;
+  const [, y, mo, d, h, mi, se, frac = '', zone] = m;
+  const off = zone === 'Z' ? 0 : (zone[0] === '-' ? -1 : 1) * (Number(zone.slice(1, 3)) * 60 + Number(zone.replace(':', '').slice(3, 5) || 0));
+  const ms = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(se)) - off * 60_000;
+  return Number.isFinite(ms) ? ms * 1000 + Number(frac.padEnd(6, '0')) : null;
+}
+
+/** The readable fields an entry shows beside its core, and the core keys that seal them. */
+const SEALED_FIELDS = ['occurredAt', 'actorType', 'traceId'];
+
+/**
+ * Check 16 — when, by which kind of actor and under which trace (SPEC.md). An entry whose sealed core
+ * carries `occurredAt`, `actorType` or `traceId` must show the same in its readable fields — the time
+ * as the same instant, the others as the same string — since the hash covers the core and not them.
+ * An entry sealed before these keys existed shows the producer's columns, outside the hash: counted,
+ * and said. Over the listed entries and, in an incident dossier, its matched entries and the journal
+ * read for completeness (their `occurredAt` beside their `coreCanonical`).
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>}
+ */
+function verifySealedFields(pack) {
+  const listed = [...(Array.isArray(pack?.entries) ? pack.entries : []), ...(Array.isArray(pack?.impact?.entries) ? pack.impact.entries : [])];
+  const links = Array.isArray(pack?.impact?.completeness?.links) ? pack.impact.completeness.links : [];
+  const core = l => { try { return JSON.parse(l.coreCanonical); } catch { return null; } };
+  const rows = [...listed.map(e => ({ e, core: e?.core })), ...links.map(l => ({ e: l, core: core(l), link: true }))];
+  if (!listed.length) return [];
+  const bad = [];
+  let sealed = 0;
+  for (const { e, core: c, link } of rows) {
+    if (!c || typeof c !== 'object') continue;
+    if (!link && typeof c.occurredAt === 'string') sealed++;
+    for (const k of link ? ['occurredAt'] : SEALED_FIELDS) {
+      if (c[k] === undefined) continue;
+      const same = k === 'occurredAt'
+        ? instantMicros(c[k]) !== null && instantMicros(c[k]) === instantMicros(e[k])
+        : c[k] === e[k];
+      if (!same) bad.push(`entry ${e.seq}: its ${k} is not the one sealed in its core`);
+    }
+  }
+  if (bad.length) {
+    return [{ id: 'sealed.fields', ok: false, detail: `${bad.slice(0, 3).join('; ')}${bad.length > 3 ? ` (and ${bad.length - 3} more)` : ''}` }];
+  }
+  const legacy = listed.length - sealed;
+  if (!legacy) return [{ id: 'sealed.fields', ok: true, detail: `${sealed} ${sealed === 1 ? 'entry' : 'entries'}: the time, actor type and trace sealed in each core match its readable fields` }];
+  const what = 'their occurredAt, actorType and traceId are the producer’s columns, outside the hash';
+  return [{
+    id: 'sealed.fields', ok: true, level: 'warn',
+    detail: sealed
+      ? `${sealed} of ${listed.length} entries carry a sealed time, actor type and trace, matched; the other ${legacy} were sealed before: ${what}`
+      : `none of the ${listed.length} entries carries a sealed time (sealed before the time, actor and trace were bound to the chain): ${what}`,
+  }];
+}
+
+/**
+ * Run all checks over an in-memory dossier (a Map/record of path → Uint8Array).
+ * `tsaRootPem`: the TSA root(s) the auditor trusts (--tsa-root). Without it, a
+ * timestamp whose signature holds is reported with a warning: its chain can
+ * only end on certificates the dossier itself ships.
+ * @param {Record<string, Uint8Array>} files
+ * @param {{ tsaRootPem?: string, vaultContents?: Array<{ name: string, bytes: Uint8Array }>, keys?: { keys?: unknown[] } | null }} [opts]
+ * @returns {{ ok: boolean, checks: Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }> }}
+ */
+function verifyDossier(files, opts = {}) {
+  const checks = [];
+  const push = (id, ok, detail, level) => checks.push(level ? { id, ok, detail, level } : { id, ok, detail });
+
+  const dec = new TextDecoder();
+  const manifestRaw = files['manifest.json'];
+  if (!manifestRaw) {
+    push('manifest.present', false, 'manifest.json missing');
+    return { ok: false, checks };
+  }
+  let manifest;
+  try { manifest = JSON.parse(dec.decode(manifestRaw)); }
+  catch { push('manifest.parse', false, 'manifest.json is not valid JSON'); return { ok: false, checks }; }
+  push('manifest.present', true, `format_version ${manifest.format_version}`);
+
+  // 1. Per-file hashes.
+  let allFilesOk = true;
+  for (const f of manifest.files ?? []) {
+    const bytes = files[f.path];
+    if (!bytes) { push(`file.${f.path}`, false, 'listed in manifest but absent'); allFilesOk = false; continue; }
+    const got = sha256Hex(bytes);
+    const ok = got === f.sha256;
+    if (!ok) allFilesOk = false;
+    push(`file.${f.path}`, ok, ok ? 'sha256 matches' : `sha256 mismatch (expected ${f.sha256.slice(0, 12)}…, got ${got.slice(0, 12)}…)`);
+  }
+
+  // 2. root_hash.
+  const rootOk = computeRootHash(manifest.files ?? []) === manifest.root_hash;
+  push('manifest.root_hash', rootOk, rootOk ? 'root_hash matches' : 'root_hash does not match the file hashes');
+
+  // The TSA certificates: shipped by the dossier (help build a chain), pinned by the auditor (trust).
+  const shipped = files['tsa-chain.pem'] ? readPem(dec.decode(files['tsa-chain.pem'])) : [];
+  let pinned = null;
+  try { pinned = opts.tsaRootPem ? readPem(opts.tsaRootPem) : null; }
+  catch (err) { push('timestamp.root', false, `--tsa-root unreadable: ${err.message}`); }
+  if (pinned && pinned.length === 0) push('timestamp.root', false, '--tsa-root holds no certificate');
+  if (pinned && pinned.length === 0) pinned = null;
+
+  // 3. Sealed chain in evidence.json (5. decision dossier, 7. incident dossier, 8. compliance bundle,
+  //    9. platform evidence package).
+  let headTokens = 0;   // timestamped journal heads checked against the pinned root (Check 5)
+  let pack = null;      // the parsed evidence.json — Check 12 compares it with what the signature committed
+  const evidenceRaw = files['evidence.json'];
+  if (!evidenceRaw) {
+    push('chain', false, 'evidence.json missing');
+  } else {
+    try { pack = JSON.parse(dec.decode(evidenceRaw)); } catch { pack = null; }
+    if (!pack) push('chain', false, 'evidence.json is not valid JSON');
+    else {
+      if (pack.kind === 'platform') {
+        for (const c of verifyPlatformPack(pack)) checks.push(c);
+      } else if (pack.kind === 'risk_profile' || pack.kind === 'regulator') {
+        // Aggregate dossiers (Check 12): figures restated from the workspace's records, no sealed entry listed.
+        push('aggregate', true, `${pack.kind === 'risk_profile' ? 'risk profile' : 'regulator dossier'}: aggregate figures, no sealed decision listed — its files hash to the manifest, its signature and timestamp bear on it`);
+      } else if (['decision', 'litigation', 'exhaustion', 'ai_footprint', 'incident', 'compliance'].includes(pack.kind)) {
+        const verify = ['decision', 'litigation', 'exhaustion', 'ai_footprint'].includes(pack.kind) ? verifyDecisionPack : pack.kind === 'incident' ? verifyIncidentPack : verifyCompliancePack;
+        for (const c of verify(pack, files, { shipped, pinned })) checks.push(c);
+        // 14. An AI footprint statement: its findings hash and count to what the act sealed.
+        if (pack.kind === 'ai_footprint') for (const c of verifyFootprintPack(pack)) checks.push(c);
+        headTokens = (pack.segments ?? []).filter(seg => seg.anchor).length + (pack.heads ?? []).length;
+      } else {
+        const v = verifyChain(pack);
+        const segment = v.ok && v.first > 1 ? `, seq ${v.first}–${v.last}, attached to prev_hash ${String(v.startPrevHash).slice(0, 12)}…` : '';
+        const listed = v.ok && v.listed !== undefined ? `; the ${v.listed} listed decisions are in it` : '';
+        push('chain', v.ok, v.ok ? `chain intact (${v.verified} sealed decisions${segment})${listed}` : `${v.reason} at seq ${v.brokenAt}`);
+      }
+      // 15. Where the kept chain starts once the journal retention removed its oldest prefix.
+      if (pack.kind !== 'platform' && pack.kind !== 'risk_profile' && pack.kind !== 'regulator') for (const c of verifyRetention(pack)) checks.push(c);
+      // 6. Client-vault content supplied by the client (--vault-content).
+      if (opts.vaultContents?.length) for (const c of verifyVaultContents(pack, opts.vaultContents)) checks.push(c);
+      // 11. Each decision's applicable law, decided again from its seal and the shipped packs.
+      if (pack.kind !== 'platform') for (const c of verifyJurisdiction(pack.entries, files)) checks.push(c);
+      // 13. Each decision's cost, recomputed from its sealed price (and the shipped catalog versions).
+      if (pack.kind !== 'platform') for (const c of verifyPricing(pack.entries, files)) checks.push(c);
+      // 16. Each entry's time, actor type and trace, as its core seals them.
+      if (pack.kind !== 'platform') for (const c of verifySealedFields(pack)) checks.push(c);
+    }
+  }
+
+  // 4. Trusted timestamp (anchor.tsr, RFC 3161) over the manifest root_hash.
+  const tsr = files['anchor.tsr'];
+  if (!tsr) {
+    if (opts.tsaRootPem && !headTokens) push('timestamp', false, '--tsa-root given, but the dossier carries no RFC 3161 token');
+  } else {
+    const t = checkTimestamp(tsr, String(manifest.root_hash ?? ''), { shipped, pinned });
+    push('timestamp', t.ok, t.detail);
+    if (t.ok && pinned) {
+      push('timestamp.root', t.trusted, t.trusted ? `chain ends on the pinned root (${t.root})` : 'the TSA chain does not end on the root given with --tsa-root');
+    } else if (t.ok) {
+      push('timestamp.root', true, `chain ends on ${t.root}, shipped in the dossier — pin the TSA's own root with --tsa-root <pem>`, 'warn');
+    }
+  }
+
+  // 12. The dossier's signature (signature.jws, over root_hash) — required, by a pinned key — and,
+  //     from format 2, the coverage it commits: the kind, the chain's head at export, the entries listed.
+  for (const c of verifyDossierSignature(files, String(manifest.root_hash ?? ''), { keys: opts.keys ?? null, pack })) checks.push(c);
+
+  return { ok: allFilesOk && rootOk && checks.every(c => c.ok), checks };
+}
+
+return { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, verifyLinks, verifyChain, verifyDecisionPack, verifyVaultContents, verifySealedFields, verifyDossier };
+})();
+M.receipt = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 10 — a call's receipt (SPEC.md): the compact JWS the gateway hands back with every
+ * answer. Verified with the workspace's published keys (a JWKS — `keys.jwks.json` in any
+ * dossier), and, with a dossier, tied to the sealed decision it certifies.
+ *
+ * Zero dependencies, zero network, and no Azoth code: the rules are SPEC.md's,
+ * reimplemented here; the cryptography is crypto.mjs's (node:crypto, or the web verifier's).
+ */
+const { canonicalCore, sha256Hex } = M.chain;
+const { base64url, fromBase64, fromUtf8, utf8 } = M.bytes;
+const { digest, verifyEd25519 } = M.crypto;
+const { keyTrustAt } = M.keys;
+
+const TYP = 'azoth-receipt+jws';
+const OUTCOMES = new Set(['allowed', 'blocked', 'rerouted', 'held', 'failed', 'act']);
+const B64URL = /^[A-Za-z0-9_-]+$/;
+const json = part => JSON.parse(fromUtf8(fromBase64(part)));
+
+/** The receipt's header, claims, signing input and signature — or an error naming what is wrong. */
+function decodeReceipt(token) {
+  const parts = String(token).trim().split('.');
+  if (parts.length !== 3 || !parts.every(p => B64URL.test(p))) return { error: 'not a compact JWS (three base64url parts)' };
+  let header; let claims;
+  try { header = json(parts[0]); claims = json(parts[1]); } catch { return { error: 'header or claims are not JSON' }; }
+  if (header?.alg !== 'EdDSA' || header?.typ !== TYP || typeof header?.kid !== 'string') return { error: `header must be { alg: "EdDSA", typ: "${TYP}", kid }` };
+  const c = claims ?? {};
+  if (c.v !== 1 || typeof c.ws !== 'string' || typeof c.trace !== 'string' || !/^[0-9a-f]{64}$/.test(String(c.core))
+      || !OUTCOMES.has(c.out) || !Number.isInteger(c.iat) || (c.ref !== undefined && !/^[0-9a-f]{64}$/.test(String(c.ref)))) {
+    return { error: 'claims must be { v: 1, ws, trace, core: sha256 hex, out, ref?: sha256 hex, iat: seconds }' };
+  }
+  return { header, claims: c, signingInput: `${parts[0]}.${parts[1]}`, signature: fromBase64(parts[2]) };
+}
+
+/** Every sealed core the dossier holds, by its sha256: listed entries and chain links. */
+function coresOf(pack) {
+  const at = new Map();
+  for (const e of Array.isArray(pack?.entries) ? pack.entries : []) at.set(sha256Hex(canonicalCore(e.core)), { seq: e.seq, traceId: e.traceId ?? null });
+  const links = [...(Array.isArray(pack?.chain) ? pack.chain : []), ...(Array.isArray(pack?.segments) ? pack.segments.flatMap(s => s.links ?? []) : [])];
+  for (const l of links) if (typeof l.coreCanonical === 'string' && !at.has(sha256Hex(l.coreCanonical))) at.set(sha256Hex(l.coreCanonical), { seq: l.seq, traceId: null });
+  return at;
+}
+
+/**
+ * Check 10. `jwks`: { keys: [...] } (the workspace's published keys). `pack`: a dossier's
+ * evidence.json, to find the decision the receipt certifies (optional).
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>}
+ */
+function verifyReceipt(token, jwks, { pack = null } = {}) {
+  const out = [];
+  const push = (id, ok, detail, level) => out.push(level ? { id, ok, detail, level } : { id, ok, detail });
+  const r = decodeReceipt(token);
+  if (r.error) { push('receipt.format', false, r.error); return out; }
+  const { header, claims } = r;
+  push('receipt.format', true, `outcome ${claims.out}, trace ${claims.trace}, signed ${new Date(claims.iat * 1000).toISOString()}`);
+
+  const key = (Array.isArray(jwks?.keys) ? jwks.keys : []).find(k => k?.kid === header.kid);
+  if (!key || key.kty !== 'OKP' || key.crv !== 'Ed25519' || typeof key.x !== 'string') {
+    push('receipt.key', false, `no Ed25519 key ${header.kid} among the keys given`);
+    return out;
+  }
+  // The kid is the key's RFC 7638 thumbprint: a key cannot be swapped under the same id.
+  const thumbprint = base64url(digest('sha256', utf8(JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: key.x }))));
+  if (thumbprint !== header.kid) { push('receipt.key', false, `key ${header.kid} does not hash to its id`); return out; }
+  // A key its producer declared compromised signs nothing trusted from that instant on (keys.mjs, keyTrustAt).
+  const trust = keyTrustAt(key, claims.iat);
+  if (!trust.ok) { push('receipt.key', false, `key ${header.kid.slice(0, 12)}… is refused: ${trust.detail}`); return out; }
+  const retiredLate = key.status === 'retired' && key.retired_at && claims.iat * 1000 > Date.parse(key.retired_at) + 10 * 60_000;
+  push('receipt.key', true, `key ${header.kid.slice(0, 12)}…${key.status === 'retired' ? ` (retired ${key.retired_at})` : ''}`);
+  if (retiredLate) push('receipt.key.retired', true, 'signed more than 10 minutes after its key was retired', 'warn');
+  if (trust.warn) push('receipt.key.compromised', true, trust.warn, 'warn');
+
+  let valid = false;
+  try { valid = verifyEd25519(key.x, utf8(r.signingInput), r.signature); }
+  catch { valid = false; }
+  push('receipt.signature', valid, valid ? 'Ed25519 signature valid' : 'signature does not verify (receipt altered, or another key)');
+  if (!valid || !pack) return out;
+
+  const hit = coresOf(pack).get(claims.core);
+  if (!hit) push('receipt.decision', false, 'the decision this receipt certifies is not in this dossier (outside its period, or missing from its chain)');
+  else if (hit.traceId && hit.traceId !== claims.trace) push('receipt.decision', false, `sealed at seq ${hit.seq} under another trace (${hit.traceId})`);
+  else push('receipt.decision', true, `the decision it certifies is sealed at seq ${hit.seq} of this dossier's chain (see the chain checks)`);
+  return out;
+}
+
+return { decodeReceipt, verifyReceipt };
+})();
+M.app = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * The offline web verifier's page: the same checks as `azoth-verify` (SPEC.md),
+ * on files the reader chooses, entirely in this page — the page's own policy forbids any
+ * network access (connect-src 'none'), and nothing here asks for one. Bundled into one HTML file
+ * by scripts/build-web.mjs, with crypto-web.mjs as its cryptography.
+ */
+const { verifyDossier } = M.verify;
+const { verifyReceipt } = M.receipt;
+const { readZip } = M.zip;
+const { fromUtf8 } = M.bytes;
+
+const TEXT = {
+  en: {
+    title: 'Azoth verifier — offline', lead: 'Checks an evidence dossier, a receipt and their timestamps entirely in this page: nothing is sent anywhere — the page forbids itself any network access. The same rules as the azoth-verify command line (SPEC.md).',
+    dossier: 'Evidence dossier (.zip)', root: 'Root certificate of the time-stamping authority (PEM, optional) — to trust its timestamps',
+    receipt: 'Receipt (the X-Azoth-Receipt header, optional)', keys: 'The workspace\'s published keys (keys.jwks.json, from /api/proof/keys/<workspace> — for a platform package, /api/proof/platform-keys) — required: a dossier verifies only under a key you chose, never one it ships',
+    run: 'Verify', pass: 'PASS', warn: 'NOTE', fail: 'FAIL', ok: 'VERIFIED — everything is intact.', ko: 'FAILED — something does not verify.',
+    nothing: 'Choose a dossier, or paste a receipt.', noKeys: 'A receipt is checked against the workspace\'s keys: give a dossier that holds them, or keys.jwks.json.',
+    unreadable: 'Unreadable file: {e}', note: 'Each check\'s detail is in English, as in the specification.',
+  },
+  fr: {
+    title: 'Vérificateur Azoth — hors ligne', lead: 'Vérifie un dossier de preuve, un reçu et leurs horodatages entièrement dans cette page : rien n’est envoyé nulle part — la page s’interdit tout accès réseau. Les mêmes règles que la commande azoth-verify (SPEC.md).',
+    dossier: 'Dossier de preuve (.zip)', root: 'Certificat racine de l’autorité d’horodatage (PEM, facultatif) — pour faire confiance à ses horodatages',
+    receipt: 'Reçu (l’en-tête X-Azoth-Receipt, facultatif)', keys: 'Les clés publiées du workspace (keys.jwks.json, à l’adresse /api/proof/keys/<workspace> — pour un dossier de la plateforme, /api/proof/platform-keys) — requises : un dossier ne se vérifie que sous une clé que vous avez choisie, jamais sous celle qu’il apporte',
+    run: 'Vérifier', pass: 'OK', warn: 'À NOTER', fail: 'ÉCHEC', ok: 'VÉRIFIÉ — tout est intact.', ko: 'ÉCHEC — quelque chose ne se vérifie pas.',
+    nothing: 'Choisissez un dossier, ou collez un reçu.', noKeys: 'Un reçu se vérifie avec les clés du workspace : donnez un dossier qui les contient, ou keys.jwks.json.',
+    unreadable: 'Fichier illisible : {e}', note: 'Le détail de chaque contrôle est en anglais, comme dans la spécification.',
+  },
+};
+const lang = String(globalThis.navigator?.language ?? 'en').toLowerCase().startsWith('fr') ? 'fr' : 'en';
+const t = (k, v = {}) => TEXT[lang][k].replace(/\{(\w+)\}/g, (_, n) => String(v[n] ?? ''));
+const $ = id => document.getElementById(id);
+
+/** A chosen file's bytes (FileReader: every browser, and jsdom). */
+const bytesOf = file => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(new Uint8Array(r.result));
+  r.onerror = () => reject(r.error ?? new Error('read failed'));
+  r.readAsArrayBuffer(file);
+});
+
+function show(checks, ok) {
+  const list = $('checks');
+  list.replaceChildren(...checks.map(c => {
+    const li = document.createElement('li');
+    const level = !c.ok ? 'fail' : c.level === 'warn' ? 'warn' : 'pass';
+    li.className = level;
+    const tag = document.createElement('strong');
+    tag.textContent = t(level);
+    const id = document.createElement('code');
+    id.textContent = c.id;
+    li.append(tag, ' ', id, ' ', c.detail);
+    return li;
+  }));
+  const verdict = $('verdict');
+  verdict.textContent = ok ? t('ok') : t('ko');
+  verdict.className = ok ? 'pass' : 'fail';
+}
+
+function say(message) {
+  $('checks').replaceChildren();
+  const verdict = $('verdict');
+  verdict.textContent = message;
+  verdict.className = 'fail';
+}
+
+async function run() {
+  const dossierFile = $('dossier').files?.[0];
+  const rootFile = $('root').files?.[0];
+  const keysFile = $('keys').files?.[0];
+  const receipt = $('receipt').value.trim();
+  if (!dossierFile && !receipt) { say(t('nothing')); return; }
+  let files = null; let tsaRootPem; let jwks = null;
+  try {
+    if (dossierFile) files = readZip(await bytesOf(dossierFile));
+    if (rootFile) tsaRootPem = fromUtf8(await bytesOf(rootFile));
+    if (keysFile) jwks = JSON.parse(fromUtf8(await bytesOf(keysFile)));
+    else if (files?.['keys.jwks.json']) jwks = JSON.parse(fromUtf8(files['keys.jwks.json']));
+  } catch (err) { say(t('unreadable', { e: err?.message ?? String(err) })); return; }
+
+  // Keys the reader chose are the ones pinned: the dossier's signature is checked against them too.
+  const checks = files ? [...verifyDossier(files, { tsaRootPem, keys: keysFile ? jwks : null }).checks] : [];
+  if (receipt) {
+    if (!jwks) { say(t('noKeys')); return; }
+    let pack = null;
+    try { pack = files?.['evidence.json'] ? JSON.parse(fromUtf8(files['evidence.json'])) : null; } catch { pack = null; }
+    checks.push(...verifyReceipt(receipt, jwks, { pack }));
+  }
+  show(checks, checks.every(c => c.ok));
+}
+
+document.documentElement.lang = lang;
+document.title = t('title');
+for (const el of document.querySelectorAll('[data-t]')) el.textContent = t(el.dataset.t);
+$('run').addEventListener('click', () => {
+  $('run').disabled = true;
+  run().finally(() => { $('run').disabled = false; });
+});
+
+return {  };
+})();
+</script>
+</body>
+</html>

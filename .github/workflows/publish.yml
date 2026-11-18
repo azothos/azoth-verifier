@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2026 Beweird SAS
+# SPDX-License-Identifier: Apache-2.0
+#
+# Publish a version to npm, from this public repository only — the tag vX.Y.Z that each snapshot
+# brings. npm trusted publishing (OIDC): no token is stored anywhere, and npm generates the
+# provenance statement that ties the package to this repository, this workflow and this commit.
+#
+# The `npm` environment has a required reviewer: the publication waits for a person's approval.
+name: publish
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24'
+      - name: Tests
+        run: node --test
+      - name: The web page is what the sources build
+        run: node scripts/build-web.mjs --check
+      - name: The tag is the package's version
+        run: |
+          version="v$(node -p "require('./package.json').version")"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::package.json says $version, the tag is $GITHUB_REF_NAME"; exit 1
+          fi
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write   # the OIDC token npm trusted publishing exchanges — and the provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing needs npm 11.5.1 or later.
+      - name: npm 11
+        run: npm install -g npm@11
+      - name: Publish
+        run: npm publish --access public

@@ -1,0 +1,59 @@
+{
+  "name": "@azothos/verifier",
+  "version": "2.2.0",
+  "description": "Verify Azoth OS evidence dossiers and call receipts offline: zero dependencies, no network, no code shared with the producer",
+  "type": "module",
+  "bin": {
+    "azoth-verify": "./bin/azoth-verify.mjs"
+  },
+  "main": "./src/verify.mjs",
+  "exports": {
+    ".": "./src/verify.mjs",
+    "./receipt": "./src/receipt.mjs",
+    "./zip": "./src/zip.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "src",
+    "web/azoth-verify.html",
+    "SPEC.md",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "verify": "node bin/azoth-verify.mjs",
+    "test": "node --test",
+    "build:web": "node scripts/build-web.mjs"
+  },
+  "keywords": [
+    "audit",
+    "evidence",
+    "verification",
+    "compliance",
+    "hash-chain",
+    "rfc3161",
+    "jws",
+    "cli"
+  ],
+  "author": "Azoth OS",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/azothos/azoth-verifier.git"
+  },
+  "homepage": "https://github.com/azothos/azoth-verifier#readme",
+  "bugs": {
+    "url": "https://github.com/azothos/azoth-verifier/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

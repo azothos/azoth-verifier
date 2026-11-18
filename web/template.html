@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2026 Beweird SAS -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="%CSP%">
+<meta name="referrer" content="no-referrer">
+<title>Azoth verifier — offline</title>
+<style>%STYLE%</style>
+</head>
+<body>
+<main>
+  <h1 data-t="title">Azoth verifier — offline</h1>
+  <p class="lead" data-t="lead"></p>
+  <label for="dossier" data-t="dossier"></label>
+  <input id="dossier" type="file" accept=".zip,application/zip">
+  <label for="root" data-t="root"></label>
+  <input id="root" type="file" accept=".pem,.crt,.cer,text/plain">
+  <label for="receipt" data-t="receipt"></label>
+  <textarea id="receipt" rows="3" spellcheck="false"></textarea>
+  <label for="keys" data-t="keys"></label>
+  <input id="keys" type="file" accept=".json,application/json">
+  <button id="run" type="button" data-t="run">Verify</button>
+  <p id="verdict" role="status"></p>
+  <ol id="checks"></ol>
+  <p class="note" data-t="note"></p>
+</main>
+<script>%SCRIPT%</script>
+</body>
+</html>
