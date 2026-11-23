@@ -10,9 +10,17 @@
  * kind it is cited for, and no requirement is marked covered unless each of its
  * required groups has such an entry. Like the rest of the verifier it shares
  * nothing with Azoth's code: the predicate rule is reimplemented from SPEC.md.
+ *
+ * A journal head the bundle cites as rooted (a kind of source `root`) is held to
+ * Check 18's proof, steps 1 to 4 (headroot.mjs): the leaf recomputed from the
+ * bundle's workspace and verified link, the path to the root, the root's token,
+ * its dates — trusted only through a pinned root.
  */
-import { sha256Hex, canonicalCore, computeEntryHash, verifyLinks } from './chain.mjs';
-import { checkTimestamp } from './timestamp.mjs';
+import { fromUtf8 } from './bytes.mjs';
+import { sha256Hex, canonicalCore, entryCanonical, computeEntryHash, verifyLinks } from './chain.mjs';
+import { checkTimestamp, readPem } from './timestamp.mjs';
+import { signedAt, verifyRootProof } from './headroot.mjs';
+import { carried } from './signature.mjs';
 
 const bySeq = (a, b) => a.seq - b.seq;
 
@@ -68,7 +76,7 @@ export function verifyCompliancePack(pack, files, { shipped = [], pinned = null 
   }
   const verified = new Map();
   for (const e of entries) {
-    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) { broken ??= `entry_hash mismatch (cited entry altered) at seq ${e.seq}`; continue; }
+    if (entryCanonical(e) === null || computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) { broken ??= `entry_hash mismatch (cited entry altered) at seq ${e.seq}`; continue; }
     const l = at.get(e.seq);
     if (!individual && (!l || l.entryHash !== e.entryHash || l.prevHash !== e.prevHash)) { broken ??= `entry ${e.seq} is not in a verified chain segment`; continue; }
     verified.set(e.seq, e);
@@ -97,6 +105,29 @@ export function verifyCompliancePack(pack, files, { shipped = [], pinned = null 
     heads.add(h.journalSeq);
   }
 
+  // 3b. Journal heads in an hourly platform root, cited as evidence: each proof as Check 18 holds one, on the
+  //     bundle's own workspace and verified links; with --tsa-root, a root whose path ends elsewhere counts nothing.
+  const rooted = new Set();
+  const proofs = Array.isArray(pack.rootedHeads) ? pack.rootedHeads : [];
+  if (proofs.length) {
+    let chain = [];
+    if (typeof pack.rootChain === 'string' && files[pack.rootChain]) {
+      try { chain = readPem(fromUtf8(files[pack.rootChain])); } catch { chain = []; }
+    }
+    const hashes = new Map([...at].map(([seq, l]) => [seq, l.entryHash]));
+    const links = carried(pack).filter(l => at.get(l.seq)?.entryHash === l.entryHash);
+    const signed = signedAt(files);
+    for (const p of proofs) {
+      const seq = Number(p?.seq);
+      const r = verifyRootProof(p, {
+        id: `compliance.root.${Number.isFinite(seq) ? seq : '?'}`, subject: typeof pack.workspaceId === 'string' ? pack.workspaceId : null,
+        hashes, links, files, shipped, chain, pinned, signed,
+      });
+      out.push(...r.checks);
+      if (r.passed && (!pinned || r.trusted)) rooted.add(seq);
+    }
+  }
+
   if (!doc) return out;
   const kinds = new Map((doc.kinds ?? []).map(k => [k.id, k]));
   const reqs = new Map(doc.framework.requirements.map(r => [r.id, r]));
@@ -115,6 +146,7 @@ export function verifyCompliancePack(pack, files, { shipped = [], pinned = null 
       let n = 0;
       for (const seq of cited) {
         if (k.source === 'anchor') { if (heads.has(seq)) n++; else bad ??= `${r.id}: head ${seq} cited as ${kindId} is not a verified timestamped head`; continue; }
+        if (k.source === 'root') { if (rooted.has(seq)) n++; else bad ??= `${r.id}: head ${seq} cited as ${kindId} is not a verified head of an hourly root`; continue; }
         const e = verified.get(seq);
         if (!e) bad ??= `${r.id}: entry ${seq} cited as ${kindId} is not a verified entry of the bundle`;
         else if (!matchesKind(k, e.core)) bad ??= `${r.id}: entry ${seq} is not evidence of ${kindId}`;

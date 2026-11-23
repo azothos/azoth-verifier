@@ -1,15 +1,16 @@
 {
   "name": "@azothos/verifier",
-  "version": "2.2.0",
-  "description": "Verify Azoth OS evidence dossiers and call receipts offline: zero dependencies, no network, no code shared with the producer",
+  "version": "2.4.1",
+  "description": "Verify Azoth OS evidence dossiers, signed JSON evidence packs and call receipts offline: zero dependencies, no network, no code shared with the producer",
   "type": "module",
   "bin": {
-    "azoth-verify": "./bin/azoth-verify.mjs"
+    "azoth-verify": "bin/azoth-verify.mjs"
   },
   "main": "./src/verify.mjs",
   "exports": {
     ".": "./src/verify.mjs",
     "./receipt": "./src/receipt.mjs",
+    "./export": "./src/export.mjs",
     "./zip": "./src/zip.mjs",
     "./package.json": "./package.json"
   },

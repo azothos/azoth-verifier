@@ -26,8 +26,8 @@ const PKG = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 /** The modules, dependencies first: [name, path inside the package]. */
 const MODULES = [
   ['bytes', 'src/bytes.mjs'], ['der', 'src/der.mjs'], ['keys', 'src/keys.mjs'], ['crypto', 'src/crypto-web.mjs'], ['x509', 'src/x509.mjs'], ['zip', 'src/zip.mjs'],
-  ['chain', 'src/chain.mjs'], ['timestamp', 'src/timestamp.mjs'], ['incident', 'src/incident.mjs'], ['compliance', 'src/compliance.mjs'],
-  ['platform', 'src/platform.mjs'], ['jurisdiction', 'src/jurisdiction.mjs'], ['litigation', 'src/litigation.mjs'], ['signature', 'src/signature.mjs'], ['pricing', 'src/pricing.mjs'], ['footprint', 'src/footprint.mjs'], ['retention', 'src/retention.mjs'], ['verify', 'src/verify.mjs'], ['receipt', 'src/receipt.mjs'], ['app', 'web/app.mjs'],
+  ['chain', 'src/chain.mjs'], ['timestamp', 'src/timestamp.mjs'], ['incident', 'src/incident.mjs'],
+  ['platform', 'src/platform.mjs'], ['jurisdiction', 'src/jurisdiction.mjs'], ['litigation', 'src/litigation.mjs'], ['signature', 'src/signature.mjs'], ['pricing', 'src/pricing.mjs'], ['footprint', 'src/footprint.mjs'], ['retention', 'src/retention.mjs'], ['headroot', 'src/headroot.mjs'], ['compliance', 'src/compliance.mjs'], ['verify', 'src/verify.mjs'], ['receipt', 'src/receipt.mjs'], ['export', 'src/export.mjs'], ['app', 'web/app.mjs'],
 ];
 /** An import specifier → the module it names (crypto.mjs is the web one here). */
 const nameOf = spec => {

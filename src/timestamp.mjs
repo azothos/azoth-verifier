@@ -12,7 +12,7 @@
 import { tlv, items, oidOf, intOf, timeOf } from './der.mjs';
 import { concat, equal, fromHex } from './bytes.mjs';
 import { digest, verifySignature } from './crypto.mjs';
-import { parseCertificate, readPemCertificates, signatureScheme, issuedBy, signedBy } from './x509.mjs';
+import { parseCertificate, readPemCertificates, signatureScheme, certificationPath } from './x509.mjs';
 
 // ── Token ────────────────────────────────────────────────────────────────────
 
@@ -90,17 +90,19 @@ export const readPem = readPemCertificates;
 
 /**
  * Check 4: does `tsr` (anchor.tsr bytes) timestamp exactly `rootHashHex`, under a
- * valid TSA signature — and does its chain end on a certificate in `pinned`?
- * `shipped` = the certificates the dossier itself carries (tsa-chain.pem).
+ * valid TSA signature — and does its chain end on a certificate in `pinned` (or on a
+ * copy of one cross-signed by another root: the same subject and key)?
+ * `shipped` = the certificates the dossier itself carries (tsa-chain.pem); `what` names the hash in a refusal
+ * (Check 18 dates a platform root with the same check).
  * @returns {{ ok: boolean, detail: string, genTime?: Date, tsa?: string, trusted?: boolean, root?: string }}
  */
-export function checkTimestamp(tsr, rootHashHex, { shipped = [], pinned = null } = {}) {
+export function checkTimestamp(tsr, rootHashHex, { shipped = [], pinned = null, what = 'this manifest root_hash' } = {}) {
   let t;
   try { t = readTimestampResponse(tsr); } catch (err) { return { ok: false, detail: `anchor.tsr unreadable: ${err.message}` }; }
   let want;
   try { want = fromHex(rootHashHex); } catch { want = new Uint8Array(0); }
   if (t.imprintAlg !== '2.16.840.1.101.3.4.2.1' || !equal(t.imprint, want)) {
-    return { ok: false, detail: 'the timestamp does not cover this manifest root_hash' };
+    return { ok: false, detail: `the timestamp does not cover ${what}` };
   }
   const pool = [...t.certs, ...shipped, ...(pinned ?? [])];
   const signer = pool.find(c => t.sidSerial !== null && c.serial === t.sidSerial)
@@ -113,16 +115,10 @@ export function checkTimestamp(tsr, rootHashHex, { shipped = [], pinned = null }
   if (t.genTime < signer.notBefore || t.genTime > signer.notAfter) {
     return { ok: false, detail: 'genTime outside the signer certificate validity' };
   }
-  const isPinned = c => !!pinned?.some(p => p.fingerprint256 === c.fingerprint256);
-  let cert = signer;
-  let trusted = isPinned(cert);
-  for (let depth = 0; !trusted && depth < 8; depth++) {
-    if (issuedBy(cert, cert) && signedBy(cert, cert)) break;
-    const up = pool.find(c => c.fingerprint256 !== cert.fingerprint256 && issuedBy(cert, c) && signedBy(cert, c));
-    if (!up) return { ok: false, detail: 'incomplete certificate chain for the TSA' };
-    cert = up;
-    trusted = isPinned(cert);
-  }
+  // The path ends on a pinned root — a copy of it cross-signed by another root included — or, untrusted,
+  // on a self-signed certificate; every candidate issuer is tried (x509.mjs, certificationPath).
+  const path = certificationPath(signer, [...t.certs, ...shipped], pinned ?? []);
+  if (!path) return { ok: false, detail: 'incomplete certificate chain for the TSA' };
   const tsa = signer.subject.replace(/\n/g, ', ');
-  return { ok: true, genTime: t.genTime, tsa, trusted, root: cert.subject.replace(/\n/g, ', '), detail: `signed by ${tsa} at ${t.genTime.toISOString()}` };
+  return { ok: true, genTime: t.genTime, tsa, trusted: path.trusted, root: path.end.subject.replace(/\n/g, ', '), detail: `signed by ${tsa} at ${t.genTime.toISOString()}` };
 }

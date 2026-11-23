@@ -12,3 +12,10 @@ paths = [
   '''examples/receipt\.txt$''',
   '''examples/demo-dossier\.zip$''',
 ]
+# Two test identifiers the generic rule reads as keys because a « token » stands beside them (test/checks.test.mjs
+# `byId(tokenless, 'compliance.root.4')`, test/headroot.test.mjs `token: 'head-root.20261121T10Z.tsr'`): a check's id
+# and the file name of a dossier's timestamp token — never a credential. Matched on the value, its exact shape only.
+regexes = [
+  '''^compliance\.[a-z]+\.[0-9]+$''',
+  '''^head-root\.[0-9]{8}T[0-9]{2}Z\.tsr$''',
+]

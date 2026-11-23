@@ -105,3 +105,52 @@ export function signedBy(child, parent) {
     return false;
   }
 }
+
+/**
+ * `a` and `b` are one authority: the same subject Name (byte for byte) and the same public key. A
+ * root cross-signed by another root is such a copy — its issuer differs, its name and key do not.
+ */
+export const sameAuthority = (a, b) => equal(a.subjectRaw, b.subjectRaw) && equal(a.spki, b.spki);
+
+/** At most this many issuers above the leaf, and this many signatures tried. */
+const MAX_ISSUERS = 8;
+const MAX_SIGNATURES = 64;
+
+/**
+ * The certification path from `leaf` through `pool` (RFC 5280 §6; built as RFC 4158 describes):
+ * every certificate that names the current one's issuer and whose key verifies its signature is
+ * tried in turn, a dead end backtracked from — whatever order the certificates come in.
+ *
+ * - A certificate whose subject AND public key are a trust anchor's (one of `anchors`, the
+ *   certificates the reader pinned) IS that anchor: it ends the path, trusted. A copy of the pinned
+ *   root cross-signed by another root — as a TSA ships it in its token — counts as the root.
+ * - Otherwise a path ends on a self-signed certificate: untrusted, whoever shipped it.
+ *
+ * A path that ends on an anchor is preferred to any other; anchors are tried first.
+ * @returns {{ trusted: boolean, end: ReturnType<typeof parseCertificate> } | null}
+ *   null: no path ends on an anchor nor on a self-signed certificate.
+ */
+export function certificationPath(leaf, pool, anchors = []) {
+  const anchorOf = c => anchors.find(a => sameAuthority(a, c)) ?? null;
+  const candidates = [];
+  for (const c of [...anchors, ...pool]) if (!candidates.some(d => d.fingerprint256 === c.fingerprint256)) candidates.push(c);
+  // An anchor first, then a self-issued certificate (a root), then the rest.
+  const rank = c => (anchorOf(c) ? 0 : issuedBy(c, c) ? 1 : 2);
+  let left = MAX_SIGNATURES;   // a pool built to make the search explode stops it, untrusted
+  const holds = (child, parent) => left-- > 0 && signedBy(child, parent);
+  let selfSigned = null;
+  const walk = (cert, path) => {
+    const anchor = anchorOf(cert);
+    if (anchor) return { trusted: true, end: anchor };
+    if (issuedBy(cert, cert) && holds(cert, cert)) { selfSigned ??= cert; return null; }
+    if (path.length > MAX_ISSUERS) return null;   // the path holds the leaf and its issuers so far
+    const issuers = candidates.filter(c => issuedBy(cert, c) && !path.some(p => sameAuthority(p, c))).sort((a, b) => rank(a) - rank(b));
+    for (const up of issuers) {
+      if (!holds(cert, up)) continue;
+      const found = walk(up, [...path, up]);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(leaf, [leaf]) ?? (selfSigned ? { trusted: false, end: selfSigned } : null);
+}

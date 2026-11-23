@@ -11,12 +11,18 @@ dossier may also carry `dossier.pdf`, the same synthesis as `dossier.html`: it i
 listed in `manifest.files` and checked by Check 1 like any file, and so may
 `keys.jwks.json`, the keys that sign the receipts of its calls (Check 10) and the
 dossier itself, `jurisdiction-packs.json` (Check 11), `model-catalog.json`
-(Check 13) and the plain-language notices `how-to-verify.html` /
-`comment-verifier.html`. `signature.jws` (Check 12), like `anchor.tsr`, is
+(Check 13) and the plain-language notices `how-to-verify.html`,
+`comment-verifier.html` and `how-to-verify.<es|zh|ar>.html`. A dossier's
+readable files (`*.html`, `*.pdf`, in any language) restate `evidence.json`:
+Check 1 covers them like any file, and no check reads them. `signature.jws` (Check 12), like `anchor.tsr`, is
 outside the manifest: it signs the manifest's `root_hash`. Every dossier and
 every platform package must carry it, signed by a key the verifier was given:
 without it nothing binds the content to a key, and whoever handed the dossier
 over could have removed entries and recomputed the manifest.
+
+A journal export may also come as a **JSON evidence pack**: the same pack as a dossier's
+`evidence.json`, answered as the body of an HTTP response whose `X-Azoth-Export-Signature` header
+signs it. Check 17 verifies it.
 
 What the checks prove is integrity, order, origin, coverage and time: the files
 are the ones sealed, chained in that order, signed by the workspace's key, they
@@ -135,6 +141,11 @@ must reproduce:
 concatenation is plain string concatenation (no separator byte). The genesis
 entry's `prevHash` is the empty string `""`.
 
+**The core shown is the core sealed.** A listed entry is hashed from its `core`, so the core a reader
+sees is the one the chain holds. An entry that also carries the producer's `coreCanonical` beside its
+`core` must have `coreCanonical == core_canonical(core)`; otherwise it fails, as an altered entry. This
+applies wherever an entry is listed (Checks 3, 5, 7, 8 and 17).
+
 **Linkage:** order the entries by `seq` ascending; seqs must follow each other
 (n, n+1, …) and each entry's `prevHash` must equal the previous entry's
 `entryHash`. Any insertion, removal, reorder, or edit breaks one of these
@@ -191,12 +202,27 @@ chain. Neither file is in `manifest.files`: the timestamp signs
 5. **Signer.** The signer certificate must carry the extended key usage
    `id-kp-timeStamping` (`1.3.6.1.5.5.7.3.8`), and `genTime` must fall within its
    validity period.
-6. **Chain.** From the signer, follow issuers (a certificate whose subject is
-   the issuer and whose key verifies the signature) until a self-signed
-   certificate. **Trust:** the timestamp is trusted only if this path reaches a
-   certificate the verifier pinned itself (`--tsa-root`, the TSA's published
-   root). Certificates shipped in the dossier help build the path but never
-   establish trust: without a pinned root the check **warns** (it does not fail).
+6. **Chain.** From the signer, follow issuers: a certificate whose subject is
+   the issuer Name (byte for byte) and whose key verifies the signature, taken
+   from the token's `certificates`, `tsa-chain.pem` and the pinned certificates,
+   in any order. Every such candidate is tried in turn — a candidate that leads
+   nowhere is backtracked from (RFC 4158), the pinned ones first — up to 8
+   issuers above the signer, one subject and key never twice in a path, 64
+   signatures checked at most. A path ends on:
+   - **a trust anchor**: a certificate whose subject Name and public key
+     (`subjectPublicKeyInfo`, byte for byte) are those of a certificate the
+     verifier pinned itself (`--tsa-root`, the TSA's published root). A copy of
+     that root cross-signed by another root — same subject and key, another
+     issuer, as some TSAs ship in their tokens — is the root: the path ends
+     there, trusted. A pinned intermediate is an anchor too;
+   - otherwise **a self-signed certificate** (its subject is its issuer and its
+     own key verifies it), untrusted.
+
+   **Trust:** the timestamp is trusted only if a path ends on a trust anchor;
+   such a path is preferred to any other. Certificates shipped in the dossier help
+   build the path but never establish trust: without a pinned root the check
+   **warns** (it does not fail), and with one, a path that ends elsewhere fails.
+   No path at all (an issuer nowhere to be found) fails.
 
 `genTime` is then the time, attested by the TSA, at which `root_hash` — hence
 every file and every sealed decision of the dossier — existed.
@@ -327,8 +353,20 @@ It replaces Check 3:
 3. **Heads.** Each `heads[i]` is a journal head an RFC 3161 authority timestamped:
    `heads[i].file` is a TimeStampResp whose imprint equals the `entryHash` of the
    link at `journalSeq`, verified as in Check 4.
+   **Rooted heads** (added in verifier 2.4.0). Each `rootedHeads[i]` is a journal head
+   that was a leaf of an hourly platform root, in the format of a proof of
+   `head-roots.json` (Check 18): `{ seq, entryHash, leafIndex, treeSize, path, root,
+   hour, token }`, its `token` a file of the bundle (in the manifest), `rootChain` (when
+   not null) a file of PEM certificates that help build the authority's path. Each is
+   checked as Check 18 checks a proof, steps 1 to 4: the subject is the bundle's
+   `workspaceId`, the leaf is recomputed from the `entryHash` of the link at `seq` of a
+   **verified** segment (step 2), the path leads to `root`, the token verifies over
+   `root` (Check 4), its dates hold (`iat` of `signature.jws` as *S*). Lines
+   `compliance.root.<seq>` (and `.dates`). With a pinned root (`--tsa-root`), a token
+   whose path ends elsewhere fails and the head is not verified; without one, the
+   head is verified with a warning.
 4. **Predicates.** A kind is `{ id, source }` with `source` one of `journal`,
-   `anchor`, `external`. A `journal` kind has `match`:
+   `anchor`, `root`, `external`. A `journal` kind has `match`:
    `surface` (equal to `core.surface`); `decisions` and/or `decisionPrefixes`
    (when either is given, `core.decision` is one of `decisions` or starts with one
    of `decisionPrefixes`); `policy` (`{ key: { present: true } }` — `core.policy[key]`
@@ -338,7 +376,7 @@ It replaces Check 3:
 5. **Citations.** For each requirement and each kind of `requirements[i].evidence`:
    an `external` kind has `sealed == 0` and cites nothing; `cited.length <= sealed`;
    each cited seq is a verified entry matching the kind's predicate (an `anchor`
-   kind: a verified head of step 3).
+   kind: a verified head of step 3; a `root` kind: a verified rooted head of step 3).
 6. **Coverage.** Every requirement of the framework is listed. A requirement with
    `status == "covered"` has, for **each** group of `required`, at least one kind
    with a valid citation. `status == "out_of_scope"` with `reason ==
@@ -481,13 +519,18 @@ whole chain rewritten, with the manifest recomputed to match. It is a compact JW
              | "risk_profile" | "exhaustion" | "ai_footprint" | "platform",
   "head":    { "seq", "hash" } | null,              // the chain's last entry when the dossier was made
   "entries": { "count", "first", "last" },          // what evidence.json lists (seqs; null when none)
-  "filters": { "<name>": string | number | boolean | null, ... } }
+  "filters": { "<name>": string | number | boolean | null, ... },
+  "roots":   { "since", "proofs" } | null }         // optional: the hourly roots (Check 18, step 5)
 ```
 
 `kind` is `evidence.json`'s `kind`, `audit` when it has none (a journal export). `entries` counts
 `evidence.json`'s `entries` — a platform package's `chain` — with the smallest and the largest `seq`.
 `filters` are the export's own selection (a period, a decision reference's hash, an incident…).
-Format 1 claims are `{ "v": 1, "ws", "root", "iat" }` only.
+`roots`, which a producer that predates it leaves out, states what the export ships of the hourly
+platform roots — Check 18 reads it; every Azoth producer states it from 2026-11-22T00:00:00Z, and a dossier
+dated after that whose claims leave it out is said (Check 18, step 5). The claims stay format 2: a verifier
+before 2.4.0 refuses any other `v`, and would refuse every dossier made since. Format 1 claims are
+`{ "v": 1, "ws", "root", "iat" }` only.
 
 1. `root` equals the manifest's `root_hash`; when `evidence.json` names its `workspaceId`, it equals
    `ws`; a platform package's `ws` is `"platform"`.
@@ -650,6 +693,200 @@ An entry sealed before these keys existed carries none of them: its readable fie
 producer's columns, outside the hash, and it verifies as before. The verifier counts the entries that
 carry a sealed time; when some do not, it says so (a warning).
 
+## Check 17 — a signed JSON evidence pack (`X-Azoth-Export-Signature`)
+
+Added in verifier 2.3.0. Azoth answers the journal export without making a ZIP — `GET
+/api/v1/journal/export` — with a body that is the pack a dossier's `evidence.json` holds (Check 3,
+no `kind`: an `audit` pack) and the header `X-Azoth-Export-Signature`, a compact JWS: header
+`{ "alg": "EdDSA", "typ": "azoth-journal-export+jws", "kid" }`, claims
+
+```
+{ "v": 1, "ws", "body", "iat",
+  "kind":    "audit",
+  "head":    { "seq", "hash" } | null,
+  "entries": { "count", "first", "last" },
+  "filters": { "<name>": string | number | boolean | null, ... } }
+```
+
+`body` is `sha256` of the exact bytes of the response body as sent (after any transport encoding is
+undone); `kind`, `head`, `entries` and `filters` are what a dossier's format 2 signature commits
+(Check 12). The reader keeps the body **exactly as received** — re-indented or re-encoded, it is
+another body. The signature is given as the header's value (a text that holds the header line,
+`X-Azoth-Export-Signature: <token>`, names the same token).
+
+1. **Form.** Three base64url parts; the header and the claims as above, `iat` an integer number of
+   seconds, the coverage well formed (Check 12, format 2).
+2. **Body.** `sha256(body bytes) == body`.
+3. **Key.** The key `kid` is an Ed25519 JWK among the keys **given to the verifier** — the workspace's
+   keys as published at `/api/proof/keys/<workspace>`; the pack ships none, so without keys given the
+   check fails. `kid` is its RFC 7638 thumbprint; the Ed25519 signature verifies over
+   `<header>.<claims>` (ASCII); a key declared compromised refuses a signature whose `iat` is at or
+   after its `compromised_at` and warns on one before it (« Keys and signatures »).
+4. **Workspace.** The pack's `workspaceId` equals `ws`. When the keys given name their workspace (a
+   top-level `workspaceId` in the JWKS) or the reader names it, it equals `ws` too; when nothing names
+   it, a warning: the reader confirms they fetched the keys for that workspace.
+5. **Coverage.** As Check 12's step 4, over the pack: `kind` is the pack's (`audit`), `entries` its
+   count, first and last `seq`, no link it carries above `head.seq`, the link at `head.seq` (if any) with
+   `entryHash == head.hash`. Moreover the pack's own `filters`, as signed — a list joined with `,`, an
+   object or an absent value dropped — are `filters`, name for name.
+6. **The pack.** Check 3 over its `entries` (and `chain`, when it is filtered), Check 15 when it carries
+   `retention` or a retention act, Checks 11 and 13 for the entries that carry their seal (without the
+   files only a dossier ships: the law is then said, not decided again, and a catalog price is not
+   matched to its signed version), Check 16 for every entry whose core seals its time, actor type or
+   trace.
+
+## Check 18 — the hourly platform root (`head-roots.json`)
+
+Added in verifier 2.3.0. Every hour, Azoth puts the chain head — `seq` and `entryHash` — of every journal that
+moved since its last root (each workspace's decision journal, whatever its plan, and Azoth's platform journal) into
+ONE Merkle tree, and an RFC 3161 time-stamping authority signs its root. A dossier that carries a rooted head ships,
+outside the manifest (the proof bears on the chain, not on a hashed file), `head-roots.json`:
+
+```
+{ "v": 1, "leaf": "azoth.journal-head.v1", "subject": "<workspace id>" | "platform",
+  "chain": "head-roots-chain.pem" | null,
+  "proofs": [ { "seq", "entryHash", "leafIndex", "treeSize", "path": ["<hex>", ...], "root": "<hex>",
+                "hour": "<ISO 8601>", "token": "head-root.<yyyymmddThh>Z.tsr" }, ... ] }
+```
+
+one proof per run of consecutive links the dossier carries (the newest rooted head in it), each `token` file a
+TimeStampResp DER as the authority returned it, `chain` the authority's certificates (they help build its path, as
+`tsa-chain.pem` does; they never establish trust).
+
+**Encoding** — RFC 9162 (Certificate Transparency 2.0) §2.1, with this leaf:
+
+- *leaf data*: the UTF-8 bytes of `azoth.journal-head.v1` LF *subject* LF *seq* LF *entryHash* — *subject* the
+  workspace's id (a lowercase UUID) or `platform` for Azoth's platform journal, *seq* in decimal without sign or
+  leading zero, *entryHash* 64 lowercase hex characters;
+- *leaf hash*: `SHA-256(0x00 || leaf data)`; *node hash*: `SHA-256(0x01 || left || right)` — the prefixes keep an
+  interior node from passing for a leaf;
+- *tree*: the leaves sorted by subject (byte order), each subject once; the root is RFC 9162's MTH (for n > 1 leaves,
+  k the largest power of two below n: `node(MTH(first k), MTH(the rest))`) — an odd count is neither padded nor a
+  leaf duplicated;
+- *path*: RFC 9162's PATH (§2.1.3.1), the sibling hashes from the leaf up.
+
+For each proof:
+
+1. **The head is the dossier's.** The subject is the dossier's: `platform` for a platform package (Check 9), else
+   `evidence.json`'s `workspaceId` — or, when it names none, `ws` of `signature.jws`'s claims (Check 12 binds it).
+   A proof that names another subject fails. The dossier must carry a sealed link at `seq` — among `entries`,
+   `chain`, `segments[].links`, `impact.entries` and `impact.completeness.links` — and the leaf is recomputed from
+   that link's `entryHash`, never from the proof's (a proof's `entryHash` that differs fails).
+2. **The path leads to the root.** RFC 9162 §2.1.3.2 with `leafIndex` and `treeSize`: from the leaf hash, each path
+   element taken on the left or the right as the index says; the result must equal `root` (64 hex), the path
+   ending at the top (`sn == 0`). Otherwise it fails.
+3. **The root is dated.** The `token` file verifies as in Check 4 — imprint SHA-256 equal to `root`, the signature,
+   the signer, its path — trusted only through a pinned root (`--tsa-root`): pinned and its path ending elsewhere
+   fails; without a pinned root, a warning.
+4. **The dates hold.** With *T* the token's `genTime`, *H* the start of the hour the proof names (`hour`, which must
+   be the start of an hour, else it fails), *E* the newest time sealed by a link the dossier carries at or before
+   `seq` (the `occurredAt` of its `core`, else of its `coreCanonical`; none sealed: no *E*) and *S* the instant the
+   dossier was signed (`iat` of `signature.jws`'s claims, in seconds), each with a tolerance *t* of 5 minutes:
+   - *T* < *H* − *t* fails: the token is not that hour's root;
+   - *T* < *E* − *t* fails: a root cannot date an entry made after it;
+   - *T* > *S* + *t* fails: the export that signed the dossier cannot have shipped a root dated after it — the
+     proof was added later;
+   - *T* > *H* + 2 h, or *T* > *E* + 2 h, is a warning (one line, `head-root.<seq>.dates`): the producer roots
+     every hour, so such a root is late — its authority retried, its worker did not run, or the head was rooted
+     again — and proves only that the head existed at *T*, not when its entries were sealed.
+
+   The tolerance covers what no reader controls: the authority's clock against the producer's servers and
+   database (each kept to UTC, never exactly), and the worker's run between the token and the record of its hour
+   (one minute at most). Every failure of this step is a contradiction no clock explains.
+
+Since every link of the chain commits to the one before (Check 3), the head — and every entry the dossier links
+before it — existed, unaltered, at the token's `genTime`, whoever holds the producer's database. When the dossier
+carries such a proof, `--tsa-root` given and no `anchor.tsr` is not a failure of Check 4: the root given is the one
+Check 18 pins.
+
+Once per dossier, whether or not it carries `head-roots.json`:
+
+5. **What the signature says of the roots.** The producer reads the roots before it signs, ships only those dated
+   at or before the signature's second, and states them in the claims (Check 12): `roots`, either `null` — the
+   producer had dated no journal head when the dossier was exported — or `{ "since", "proofs" }`, `since` the
+   start of the hour of the producer's first dated root (ISO 8601, when it began dating heads) and `proofs` the
+   SHA-256 (hex) of the `head-roots.json` the export ships, `null` when it ships none. A claim of another shape
+   fails (line `head-roots`). Then:
+   - `proofs` names a hash and `head-roots.json` is missing: a warning — it was removed after the export, and
+     nothing in the dossier dates the journal's head outside the producer's database;
+   - `proofs` names a hash and `head-roots.json` hashes to another: it fails — the file was changed after the
+     export (its proofs are still checked one by one);
+   - `proofs` is `null` (or `roots` is) and `head-roots.json` is present: a warning — it was added after the
+     export; each proof is checked on its own, step 4 refusing one dated after the signature;
+   - `proofs` is `null`, `head-roots.json` is missing and the newest time sealed by a link the dossier carries is
+     at or after `since`: a warning — the dossier was sealed after the producer began dating heads, but none of its
+     links was a dated head when it was exported (it was exported before the next hourly root, or it carries no
+     link that was a head at an hour): outside the producer's database, only `anchor.tsr` (when present) dates it.
+
+   A missing `head-roots.json` never fails a dossier: a producer without a time-stamping authority dates no head.
+
+   What the signature **had** to state (added in verifier 2.4.0). Every Azoth producer states `roots` in each dossier
+   it signs from **2026-11-22T00:00:00Z** (`ROOTS_STATED_FROM`, pinned in the verifier, never read from a dossier).
+   With *S* the signature's `iat`, *E* the newest time sealed by a link the dossier carries and *A* the `genTime` of
+   its `anchor.tsr` (when its token verifies, Check 4):
+   - *S* < *E* − *t* **fails** (line `signature.dates`): an export signs what it has read, so a signature older than
+     an entry it lists was made again with its instant moved back;
+   - the claims carry no `roots` while *S*, *E*, *A* or the `genTime` of a root's token the dossier ships is at or
+     after `ROOTS_STATED_FROM`: a warning (line `head-roots`) — the dossier was signed again without the statement,
+     or by an older producer; nothing then says whether a proof was removed;
+   - `roots` is `null` (« the producer had dated no head ») and no token of the dossier verifies — no `anchor.tsr`, no
+     root's token, no journal head's (Check 5), no cited root's (Check 8) — while the dossier is dated after
+     `ROOTS_STATED_FROM`: a warning — what it holds and when it was signed are only the word of whoever holds the
+     workspace's key.
+
+   These are warnings, never failures, so that a dossier that verified keeps verifying (README, « Compatibility »):
+   an insider who holds the workspace's key, removes the proofs and the statement, is said — and fails when the
+   reader pins the authority's root without the dossier carrying any token (Check 4), or gives the published roots
+   (step 6). Check 4 also says (a warning, line `timestamp.dates`) an `anchor.tsr` dated more than 2 hours after *S*:
+   the export timestamps the manifest the moment it signs it, so such a token was added later — it proves the dossier
+   existed then, not when it was signed.
+
+6. **The root is the one published** (added in verifier 2.4.0; only when the reader gives published roots). The
+   roots live in the producer's database: whoever holds it could rewrite a chain whole, root its new head again in
+   the same hour and have it dated — steps 1 to 5 would hold. So the producer publishes every root the moment it is
+   recorded, at `GET /api/proof/head-roots?from=<ISO 8601>&to=<ISO 8601>` (public, read-only; each end taken to the
+   start of its hour; by default the last 24 hours; a week at most per answer):
+
+   ```
+   { "format": "azoth.head-roots.published/1", "leaf": "azoth.journal-head.v1", "from", "to",
+     "roots": [ { "hour": "<ISO 8601>", "root": "<hex>", "treeSize", "status": "anchored" | "pending" | "failed",
+                  "token": "<base64 TimeStampResp>" | null, "genTime": "<ISO 8601>" | null }, ... ] }
+   ```
+
+   — never a leaf, a workspace's id or a head. A reader saves these answers as they come (anyone may keep and pass
+   them on: an auditor, an insurer, an archive), and gives the files to the verifier (`--published-roots <file>`,
+   repeatable; the web page takes them as files too). The verifier reads them from disk: it fetches nothing. A file
+   of another `format` or `leaf`, or a root without an `hour` at the start of an hour, a 64-hex `root`, a positive
+   integer `treeSize`, or with a `token` that is not base64, is a usage error. Then:
+   - two published copies of one hour that hold different roots, tree sizes or tokens (a copy published while
+     pending holds no token: it agrees with its anchored copy) **fail** once (`head-roots.published`): the producer
+     changed a root it had published;
+   - for each proof that passed steps 1 to 4 (`head-root.<seq>.published`): a published root of its `hour` with
+     another `root`, or another `treeSize`, or another token than the dossier's `token` file (when the copy holds
+     one), **fails** — the head was rooted again after the publication, or the proof is not the producer's; the same
+     root and tree size passes; no published copy of that hour is a warning: not compared;
+   - published roots given to a dossier without `head-roots.json`: a warning, nothing compared — unless one of the
+     lines below says more.
+
+   Then the published roots against what the signature states and the head the dossier carries (added in verifier
+   2.4.0). The answer's `genTime` is the producer's statement of its token's time: it is compared with its other
+   statements, never trusted as a date. With *X* the later of *S* and *A* (the export's instant) and *t* the tolerance:
+   - `roots` is `null`, and the producer published an anchored root whose `genTime` ≤ *X* − *t*: it **fails** (line
+     `head-roots.published`) — the producer's statements disagree;
+   - `roots.since` is later than the `hour` of an anchored root published with `genTime` ≤ *X* − *t*: it **fails** —
+     the same;
+   - an anchored root is published with `genTime` at least two hours after *E* and ≤ *X* − *t*, and no proof of
+     `head-roots.json` that holds (steps 1 to 4) is at or after the seq of that newest entry: every journal that moves
+     is a leaf of the next hourly root, so a head at or after that entry was dated before the export. When that entry
+     is the chain's head the signature commits (`head.seq`) and the published files answer for every hour from the
+     entry's own to that root's (each file's `from`–`to`), each of their roots anchored with `genTime` ≤ *X* − *t*, it
+     **fails**: the export shipped the head's proof (the producer reads the roots before it signs) and it was removed.
+     Otherwise a warning: that entry was not the journal's head when the dossier was exported, or an hour is not
+     answered for.
+
+   What it proves is bounded by the copy: a root published — and saved by someone outside the producer — before the
+   chain was rewritten no longer matches. A reader who saves the roots only after a rewrite saves the rewritten ones.
+
 ## Verdict
 
 A dossier **verifies** iff all of the following pass — a warning never fails it:
@@ -658,17 +895,25 @@ A dossier **verifies** iff all of the following pass — a warning never fails i
 - the check of its kind: Check 3 (an audit dossier, no `kind`), Check 5 (`decision`, and
   `litigation`, `exhaustion`, `ai_footprint` as Checks 12 and 14 extend it), Check 7 (`incident`),
   Check 8 (`compliance`), Check 9 (`platform`); the aggregate kinds of Check 12 list no entry;
-- Check 4 when `anchor.tsr` is present, or when a TSA root is pinned;
+- Check 4 when `anchor.tsr` is present, or when a TSA root is pinned and the dossier carries no other token
+  (Check 5's or Check 18's);
 - Check 6 for every file supplied;
 - Check 11 and Check 13 for every entry that carries their seal;
 - Check 12, always: `signature.jws` present, by a key given to the verifier, its coverage matching
   `evidence.json` — an unsigned dossier, or one signed only by a key it ships, does not verify;
 - Check 14 for an `ai_footprint` dossier;
 - Check 15 when the pack carries `retention` or a journal retention act;
-- Check 16 for every entry whose core seals its time, actor type or trace.
+- Check 16 for every entry whose core seals its time, actor type or trace;
+- Check 18 for every proof `head-roots.json` carries, and for the signature's `roots` when it states them (their
+  shape, and the hash of `head-roots.json` when they name one), the signature no older than an entry it lists; with
+  published roots given, step 6 (each proof's root the one published for its hour, the copies agreeing with each
+  other, the signature's statement agreeing with them, the head the dossier carries proven when they dated it
+  before the export).
 
 A receipt (Check 10) verifies iff its format, key and signature pass; given a dossier, the
 dossier must verify too and hold the decision the receipt certifies.
+
+A JSON evidence pack (Check 17) verifies iff every step of Check 17 passes — a warning never fails it.
 
 The checks keep their numbers: a new check takes the next one.
 
@@ -679,9 +924,11 @@ node bin/azoth-verify.mjs dossier.zip --keys keys.jwks.json          # PASS/FAIL
 node bin/azoth-verify.mjs dossier.zip --keys keys.jwks.json --json   # machine-readable
 node bin/azoth-verify.mjs ./unzipped-dossier/ --keys keys.jwks.json  # a directory also works
 node bin/azoth-verify.mjs dossier.zip --keys keys.jwks.json --tsa-root tsa-root.pem   # pin the TSA root (Check 4)
+node bin/azoth-verify.mjs dossier.zip --keys keys.jwks.json --tsa-root tsa-root.pem --published-roots roots.json   # Check 18, step 6
 node bin/azoth-verify.mjs dossier.zip --vault-content ./decrypted/  # client-vault content (Check 6)
 node bin/azoth-verify.mjs receipt receipt.txt --dossier dossier.zip    # a call's receipt (Check 10)
 node bin/azoth-verify.mjs receipt <token> --keys keys.jwks.json        # its signature only
+node bin/azoth-verify.mjs export pack.json --signature signature.txt --keys keys.jwks.json --workspace <id>   # a JSON evidence pack (Check 17)
 ```
 
 **Without Node.js** — `web/azoth-verify.html`: one self-contained page that runs these same

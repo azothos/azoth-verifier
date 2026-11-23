@@ -5,7 +5,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-S/oN5rNiWxb+97mRoVhxllpgHuldcCa+T4eeGtO5csY='; style-src 'sha256-lHxxUH+Eb0EhJvdmeItoNjOkKxQgrF37I3kwoL0CNYo='; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-dhrbfFJE/OW6s5pvZxrxlR/jnHD5x2NnqTc1D3EqjXc='; style-src 'sha256-lHxxUH+Eb0EhJvdmeItoNjOkKxQgrF37I3kwoL0CNYo='; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'">
 <meta name="referrer" content="no-referrer">
 <title>Azoth verifier — offline</title>
 <style>/* SPDX-FileCopyrightText: 2026 Beweird SAS */
@@ -39,8 +39,14 @@ li.pass strong { color: var(--pass); } li.warn strong { color: var(--warn); } li
   <input id="dossier" type="file" accept=".zip,application/zip">
   <label for="root" data-t="root"></label>
   <input id="root" type="file" accept=".pem,.crt,.cer,text/plain">
+  <label for="publishedRoots" data-t="publishedRoots"></label>
+  <input id="publishedRoots" type="file" accept=".json,application/json" multiple>
   <label for="receipt" data-t="receipt"></label>
   <textarea id="receipt" rows="3" spellcheck="false"></textarea>
+  <label for="pack" data-t="pack"></label>
+  <input id="pack" type="file" accept=".json,application/json">
+  <label for="packSignature" data-t="packSignature"></label>
+  <textarea id="packSignature" rows="3" spellcheck="false"></textarea>
   <label for="keys" data-t="keys"></label>
   <input id="keys" type="file" accept=".json,application/json">
   <button id="run" type="button" data-t="run">Verify</button>
@@ -950,7 +956,56 @@ function signedBy(child, parent) {
   }
 }
 
-return { parseCertificate, readPemCertificates, RSA_PSS, signatureScheme, issuedBy, signedBy };
+/**
+ * `a` and `b` are one authority: the same subject Name (byte for byte) and the same public key. A
+ * root cross-signed by another root is such a copy — its issuer differs, its name and key do not.
+ */
+const sameAuthority = (a, b) => equal(a.subjectRaw, b.subjectRaw) && equal(a.spki, b.spki);
+
+/** At most this many issuers above the leaf, and this many signatures tried. */
+const MAX_ISSUERS = 8;
+const MAX_SIGNATURES = 64;
+
+/**
+ * The certification path from `leaf` through `pool` (RFC 5280 §6; built as RFC 4158 describes):
+ * every certificate that names the current one's issuer and whose key verifies its signature is
+ * tried in turn, a dead end backtracked from — whatever order the certificates come in.
+ *
+ * - A certificate whose subject AND public key are a trust anchor's (one of `anchors`, the
+ *   certificates the reader pinned) IS that anchor: it ends the path, trusted. A copy of the pinned
+ *   root cross-signed by another root — as a TSA ships it in its token — counts as the root.
+ * - Otherwise a path ends on a self-signed certificate: untrusted, whoever shipped it.
+ *
+ * A path that ends on an anchor is preferred to any other; anchors are tried first.
+ * @returns {{ trusted: boolean, end: ReturnType<typeof parseCertificate> } | null}
+ *   null: no path ends on an anchor nor on a self-signed certificate.
+ */
+function certificationPath(leaf, pool, anchors = []) {
+  const anchorOf = c => anchors.find(a => sameAuthority(a, c)) ?? null;
+  const candidates = [];
+  for (const c of [...anchors, ...pool]) if (!candidates.some(d => d.fingerprint256 === c.fingerprint256)) candidates.push(c);
+  // An anchor first, then a self-issued certificate (a root), then the rest.
+  const rank = c => (anchorOf(c) ? 0 : issuedBy(c, c) ? 1 : 2);
+  let left = MAX_SIGNATURES;   // a pool built to make the search explode stops it, untrusted
+  const holds = (child, parent) => left-- > 0 && signedBy(child, parent);
+  let selfSigned = null;
+  const walk = (cert, path) => {
+    const anchor = anchorOf(cert);
+    if (anchor) return { trusted: true, end: anchor };
+    if (issuedBy(cert, cert) && holds(cert, cert)) { selfSigned ??= cert; return null; }
+    if (path.length > MAX_ISSUERS) return null;   // the path holds the leaf and its issuers so far
+    const issuers = candidates.filter(c => issuedBy(cert, c) && !path.some(p => sameAuthority(p, c))).sort((a, b) => rank(a) - rank(b));
+    for (const up of issuers) {
+      if (!holds(cert, up)) continue;
+      const found = walk(up, [...path, up]);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(leaf, [leaf]) ?? (selfSigned ? { trusted: false, end: selfSigned } : null);
+}
+
+return { parseCertificate, readPemCertificates, RSA_PSS, signatureScheme, issuedBy, signedBy, sameAuthority, certificationPath };
 })();
 M.zip = (() => {
 // SPDX-FileCopyrightText: 2026 Beweird SAS
@@ -1054,6 +1109,16 @@ function canonicalCore(core) {
   return JSON.stringify(sortKeys(core));
 }
 
+/**
+ * The canonical form a listed entry is hashed from: its `core`'s (Check 3). An entry that also carries
+ * the producer's `coreCanonical` must state the same string — the core a reader sees is the core
+ * sealed. Null when the two differ.
+ */
+function entryCanonical(entry) {
+  const canonical = canonicalCore(entry?.core);
+  return typeof entry?.coreCanonical === 'string' && entry.coreCanonical !== canonical ? null : canonical;
+}
+
 /** entry_hash = sha256(prev_hash || core_canonical) — plain concatenation, hex. */
 function computeEntryHash(prevHash, coreCanonical) {
   return sha256Hex(prevHash + coreCanonical);
@@ -1095,7 +1160,7 @@ function verifyLinks(links) {
 }
 
 
-return { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, bySeq, verifyLinks };
+return { sha256Hex, canonicalCore, entryCanonical, computeEntryHash, computeRootHash, bySeq, verifyLinks };
 })();
 M.timestamp = (() => {
 // SPDX-FileCopyrightText: 2026 Beweird SAS
@@ -1112,7 +1177,7 @@ M.timestamp = (() => {
 const { tlv, items, oidOf, intOf, timeOf } = M.der;
 const { concat, equal, fromHex } = M.bytes;
 const { digest, verifySignature } = M.crypto;
-const { parseCertificate, readPemCertificates, signatureScheme, issuedBy, signedBy } = M.x509;
+const { parseCertificate, readPemCertificates, signatureScheme, certificationPath } = M.x509;
 
 // ── Token ────────────────────────────────────────────────────────────────────
 
@@ -1190,17 +1255,19 @@ const readPem = readPemCertificates;
 
 /**
  * Check 4: does `tsr` (anchor.tsr bytes) timestamp exactly `rootHashHex`, under a
- * valid TSA signature — and does its chain end on a certificate in `pinned`?
- * `shipped` = the certificates the dossier itself carries (tsa-chain.pem).
+ * valid TSA signature — and does its chain end on a certificate in `pinned` (or on a
+ * copy of one cross-signed by another root: the same subject and key)?
+ * `shipped` = the certificates the dossier itself carries (tsa-chain.pem); `what` names the hash in a refusal
+ * (Check 18 dates a platform root with the same check).
  * @returns {{ ok: boolean, detail: string, genTime?: Date, tsa?: string, trusted?: boolean, root?: string }}
  */
-function checkTimestamp(tsr, rootHashHex, { shipped = [], pinned = null } = {}) {
+function checkTimestamp(tsr, rootHashHex, { shipped = [], pinned = null, what = 'this manifest root_hash' } = {}) {
   let t;
   try { t = readTimestampResponse(tsr); } catch (err) { return { ok: false, detail: `anchor.tsr unreadable: ${err.message}` }; }
   let want;
   try { want = fromHex(rootHashHex); } catch { want = new Uint8Array(0); }
   if (t.imprintAlg !== '2.16.840.1.101.3.4.2.1' || !equal(t.imprint, want)) {
-    return { ok: false, detail: 'the timestamp does not cover this manifest root_hash' };
+    return { ok: false, detail: `the timestamp does not cover ${what}` };
   }
   const pool = [...t.certs, ...shipped, ...(pinned ?? [])];
   const signer = pool.find(c => t.sidSerial !== null && c.serial === t.sidSerial)
@@ -1213,18 +1280,12 @@ function checkTimestamp(tsr, rootHashHex, { shipped = [], pinned = null } = {}) 
   if (t.genTime < signer.notBefore || t.genTime > signer.notAfter) {
     return { ok: false, detail: 'genTime outside the signer certificate validity' };
   }
-  const isPinned = c => !!pinned?.some(p => p.fingerprint256 === c.fingerprint256);
-  let cert = signer;
-  let trusted = isPinned(cert);
-  for (let depth = 0; !trusted && depth < 8; depth++) {
-    if (issuedBy(cert, cert) && signedBy(cert, cert)) break;
-    const up = pool.find(c => c.fingerprint256 !== cert.fingerprint256 && issuedBy(cert, c) && signedBy(cert, c));
-    if (!up) return { ok: false, detail: 'incomplete certificate chain for the TSA' };
-    cert = up;
-    trusted = isPinned(cert);
-  }
+  // The path ends on a pinned root — a copy of it cross-signed by another root included — or, untrusted,
+  // on a self-signed certificate; every candidate issuer is tried (x509.mjs, certificationPath).
+  const path = certificationPath(signer, [...t.certs, ...shipped], pinned ?? []);
+  if (!path) return { ok: false, detail: 'incomplete certificate chain for the TSA' };
   const tsa = signer.subject.replace(/\n/g, ', ');
-  return { ok: true, genTime: t.genTime, tsa, trusted, root: cert.subject.replace(/\n/g, ', '), detail: `signed by ${tsa} at ${t.genTime.toISOString()}` };
+  return { ok: true, genTime: t.genTime, tsa, trusted: path.trusted, root: path.end.subject.replace(/\n/g, ', '), detail: `signed by ${tsa} at ${t.genTime.toISOString()}` };
 }
 
 return { readTimestampResponse, readPem, checkTimestamp };
@@ -1238,7 +1299,7 @@ M.incident = (() => {
  * Like the rest of the verifier, this shares nothing with Azoth's code: the
  * scope predicate below is reimplemented from SPEC.md, not imported.
  */
-const { sha256Hex, canonicalCore, computeEntryHash, verifyLinks } = M.chain;
+const { sha256Hex, canonicalCore, entryCanonical, computeEntryHash, verifyLinks } = M.chain;
 const { checkTimestamp } = M.timestamp;
 
 const bySeq = (a, b) => a.seq - b.seq;
@@ -1286,7 +1347,8 @@ function verifyIncidentPack(pack, files, { shipped = [], pinned = null } = {}) {
   for (const e of entries) {
     if (broken) break;
     const p = policyOf(e);
-    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (action altered) at seq ${e.seq}`;
+    if (entryCanonical(e) === null) broken = `entry ${e.seq}: its core is not the one its coreCanonical seals`;
+    else if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (action altered) at seq ${e.seq}`;
     else if (e.core?.surface !== 'governance' || !String(e.core?.decision ?? '').startsWith('incident_')) broken = `entry ${e.seq} is not an incident action`;
     else if (p.incidentId !== pack.incidentId || p.scopeHash !== pack.scopeHash) broken = `entry ${e.seq} does not name this incident and its scope`;
     else {
@@ -1343,7 +1405,7 @@ function verifyIncidentPack(pack, files, { shipped = [], pinned = null } = {}) {
   const shown = Array.isArray(impact.entries) ? impact.entries : [];
   let bad = null;
   for (const e of shown) {
-    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) bad = `matched entry ${e.seq} altered`;
+    if (entryCanonical(e) === null || computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) bad = `matched entry ${e.seq} altered`;
     else if (inList && inList.get(e.seq) !== e.entryHash) bad = `entry ${e.seq} is not in the sealed matched set`;
     else if (!matchesScope(e.core, e.occurredAt, pack.scope)) bad = `entry ${e.seq} does not match the scope`;
     if (bad) break;
@@ -1377,172 +1439,6 @@ function verifyIncidentPack(pack, files, { shipped = [], pinned = null } = {}) {
 }
 
 return { matchesScope, verifyIncidentPack };
-})();
-M.compliance = (() => {
-// SPDX-FileCopyrightText: 2026 Beweird SAS
-// SPDX-License-Identifier: Apache-2.0
-/**
- * Check 8 — a compliance bundle (`evidence.json` kind "compliance", SPEC.md).
- *
- * The bundle says which requirements of a framework are covered by sealed
- * evidence. This check makes that claim verifiable: the framework file (its
- * requirements and the predicates of its evidence kinds) hashes to what the
- * bundle names, every cited entry recomputes and matches the predicate of the
- * kind it is cited for, and no requirement is marked covered unless each of its
- * required groups has such an entry. Like the rest of the verifier it shares
- * nothing with Azoth's code: the predicate rule is reimplemented from SPEC.md.
- */
-const { sha256Hex, canonicalCore, computeEntryHash, verifyLinks } = M.chain;
-const { checkTimestamp } = M.timestamp;
-
-const bySeq = (a, b) => a.seq - b.seq;
-
-/** Does a sealed core count as evidence of this kind? (SPEC.md, Check 8, "Predicates".) */
-function matchesKind(kind, core) {
-  if (!kind || kind.source !== 'journal' || !core || typeof core !== 'object') return false;
-  const m = kind.match ?? {};
-  if (core.surface !== m.surface) return false;
-  const decision = typeof core.decision === 'string' ? core.decision : '';
-  const decisions = Array.isArray(m.decisions) ? m.decisions : [];
-  const prefixes = Array.isArray(m.decisionPrefixes) ? m.decisionPrefixes : [];
-  if ((decisions.length || prefixes.length) && !(decisions.includes(decision) || prefixes.some(p => decision.startsWith(p)))) return false;
-  const policy = core.policy && typeof core.policy === 'object' ? core.policy : {};
-  for (const [key, rule] of Object.entries(m.policy ?? {})) {
-    const v = policy[key];
-    if (rule && 'present' in rule ? v === undefined || v === null : v !== rule?.eq) return false;
-  }
-  for (const f of m.corePresent ?? []) if (core[f] === undefined || core[f] === null) return false;
-  return true;
-}
-
-function verifyCompliancePack(pack, files, { shipped = [], pinned = null } = {}) {
-  const out = [];
-  const push = (id, ok, detail, level) => out.push(level ? { id, ok, detail, level } : { id, ok, detail });
-  const dec = new TextDecoder();
-
-  // 1. The framework document the statuses were computed against.
-  let doc = null;
-  const fwBytes = files[pack.framework?.file];
-  if (!fwBytes) push('compliance.framework', false, `${pack.framework?.file ?? 'framework file'} missing`);
-  else if (sha256Hex(fwBytes) !== pack.framework.sha256) push('compliance.framework', false, `${pack.framework.file} does not hash to the framework hash the bundle names`);
-  else {
-    try { doc = JSON.parse(dec.decode(fwBytes)); } catch { doc = null; }
-    if (!doc?.framework || doc.framework.id !== pack.framework.id) { push('compliance.framework', false, 'the framework file is not the framework the bundle names'); doc = null; }
-    else push('compliance.framework', true, `${doc.framework.id} ${doc.framework.version}: ${doc.framework.requirements.length} requirements, the evidence kinds and every text, hashed`);
-  }
-  if (doc?.framework.mappingStatus !== 'validated') push('compliance.mapping', true, 'the mapping to the framework is marked as still to be validated by an expert', 'warn');
-  const disclaimed = typeof pack.disclaimer?.en === 'string' && pack.disclaimer.en.length > 0 && typeof pack.disclaimer?.fr === 'string' && pack.disclaimer.fr.length > 0;
-  push('compliance.disclaimer', disclaimed, disclaimed ? 'the bundle states it is a tool to prepare an audit, not a certification or legal advice' : 'the bundle carries no disclaimer');
-
-  // 2. The cited entries: recomputed, inside verified chain segments.
-  const segments = Array.isArray(pack.segments) ? pack.segments : [];
-  const entries = Array.isArray(pack.entries) ? [...pack.entries].sort(bySeq) : [];
-  const individual = pack.integrity?.inclusion === 'individual';
-  const at = new Map();
-  let broken = null;
-  for (const seg of segments) {
-    const links = [...(seg.links ?? [])].sort(bySeq);
-    const v = verifyLinks(links.map(l => ({ seq: l.seq, prevHash: l.prevHash, entryHash: l.entryHash, canonical: l.coreCanonical })));
-    if (!v.ok) { broken ??= `${v.reason} at seq ${v.brokenAt}`; continue; }
-    if (links[0]?.seq !== seg.fromSeq || links[links.length - 1]?.seq !== seg.toSeq) broken ??= `segment ${seg.fromSeq}–${seg.toSeq} does not hold its declared range`;
-    for (const l of links) at.set(l.seq, l);
-  }
-  const verified = new Map();
-  for (const e of entries) {
-    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) { broken ??= `entry_hash mismatch (cited entry altered) at seq ${e.seq}`; continue; }
-    const l = at.get(e.seq);
-    if (!individual && (!l || l.entryHash !== e.entryHash || l.prevHash !== e.prevHash)) { broken ??= `entry ${e.seq} is not in a verified chain segment`; continue; }
-    verified.set(e.seq, e);
-  }
-  push('compliance.chain', !broken, broken ?? `${verified.size} cited sealed entries${individual ? ', each verified on its own' : `, in ${segments.length} verified chain segment(s)`}`);
-
-  for (const seg of segments) {
-    if (!seg.anchor) continue;
-    const last = at.get(seg.toSeq);
-    const tsr = files[seg.anchor.file];
-    if (!tsr || !last) { push(`compliance.anchor.${seg.toSeq}`, false, `${seg.anchor.file} missing`); continue; }
-    const t = checkTimestamp(tsr, last.entryHash, { shipped, pinned });
-    if (!t.ok) push(`compliance.anchor.${seg.toSeq}`, false, `journal head ${seg.toSeq}: ${t.detail}`);
-    else if (pinned) push(`compliance.anchor.${seg.toSeq}`, t.trusted, t.trusted ? `entries up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} (${t.tsa})` : 'the TSA chain does not end on the root given with --tsa-root');
-    else push(`compliance.anchor.${seg.toSeq}`, true, `entries up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} — pin the TSA's root with --tsa-root to trust it`, 'warn');
-  }
-
-  // 3. Timestamped journal heads cited as evidence.
-  const heads = new Set();
-  for (const h of Array.isArray(pack.heads) ? pack.heads : []) {
-    const link = at.get(h.journalSeq);
-    const tsr = files[h.file];
-    if (!link || !tsr) { push(`compliance.head.${h.journalSeq}`, false, `head ${h.journalSeq}: ${tsr ? 'its link is not in the bundle' : `${h.file} missing`}`); continue; }
-    const t = checkTimestamp(tsr, link.entryHash, { shipped, pinned });
-    if (!t.ok) { push(`compliance.head.${h.journalSeq}`, false, `head ${h.journalSeq}: ${t.detail}`); continue; }
-    heads.add(h.journalSeq);
-  }
-
-  if (!doc) return out;
-  const kinds = new Map((doc.kinds ?? []).map(k => [k.id, k]));
-  const reqs = new Map(doc.framework.requirements.map(r => [r.id, r]));
-  const listed = Array.isArray(pack.requirements) ? pack.requirements : [];
-
-  // 4. Every citation is evidence of the kind it is cited for.
-  const valid = new Map();   // kind id → number of valid citations, per requirement key
-  let bad = null;
-  for (const r of listed) {
-    for (const [kindId, ev] of Object.entries(r.evidence ?? {})) {
-      const k = kinds.get(kindId);
-      const cited = Array.isArray(ev?.cited) ? ev.cited : [];
-      if (!k) { bad ??= `${r.id}: kind ${kindId} is not in the framework file`; continue; }
-      if (k.source === 'external' && (cited.length || ev.sealed)) { bad ??= `${r.id}: ${kindId} is what only the organisation provides — it cannot be counted as sealed`; continue; }
-      if (cited.length > (ev.sealed ?? 0)) { bad ??= `${r.id}: more ${kindId} entries cited than counted`; continue; }
-      let n = 0;
-      for (const seq of cited) {
-        if (k.source === 'anchor') { if (heads.has(seq)) n++; else bad ??= `${r.id}: head ${seq} cited as ${kindId} is not a verified timestamped head`; continue; }
-        const e = verified.get(seq);
-        if (!e) bad ??= `${r.id}: entry ${seq} cited as ${kindId} is not a verified entry of the bundle`;
-        else if (!matchesKind(k, e.core)) bad ??= `${r.id}: entry ${seq} is not evidence of ${kindId}`;
-        else n++;
-      }
-      valid.set(`${r.id}\u0000${kindId}`, n);
-    }
-  }
-  push('compliance.citations', !bad, bad ?? 'every cited entry is evidence of the kind it is cited for');
-
-  // 5. No requirement is covered without evidence for each required group.
-  let inflated = null;
-  const missingReq = [...reqs.keys()].filter(id => !listed.some(r => r.id === id));
-  if (missingReq.length) inflated = `requirements left out of the bundle: ${missingReq.join(', ')}`;
-  const counts = { covered: 0, partial: 0, not_covered: 0, out_of_scope: 0 };
-  for (const r of listed) {
-    const req = reqs.get(r.id);
-    if (!req) { inflated ??= `${r.id} is not a requirement of the framework`; continue; }
-    counts[r.status] = (counts[r.status] ?? 0) + 1;
-    const groupHas = g => g.some(kindId => (valid.get(`${r.id}\u0000${kindId}`) ?? 0) > 0);
-    if (r.status === 'covered' && !req.required.every(groupHas)) inflated ??= `${r.id} is marked covered without verified evidence for each required group`;
-    if (r.status === 'out_of_scope' && r.reason === 'declared_out_of_scope') {
-      const s = (pack.scope ?? []).find(x => x.requirementId === r.id);
-      const e = s?.seq != null ? verified.get(s.seq) : null;
-      const p = e?.core?.policy ?? {};
-      const ok = e && e.core.surface === 'governance' && e.core.decision === 'compliance_scope_declared'
-        && p.requirementId === r.id && p.frameworkId === pack.framework.id && p.justificationHash === s.justificationHash;
-      if (!ok) inflated ??= `${r.id} is declared out of scope without its sealed declaration`;
-    }
-    if (r.status === 'out_of_scope' && r.reason === 'not_applicable' && !(req.applicability === 'high_risk' && pack.context?.highRiskUseCases === 0)) {
-      inflated ??= `${r.id} is marked not applicable, which its framework does not allow here`;
-    }
-  }
-  push('compliance.coverage', !inflated, inflated ?? `${counts.covered} requirement(s) covered, each on cited sealed evidence for every required group`);
-  if (listed.some(r => r.reason === 'not_applicable')) push('compliance.applicability', true, 'requirements marked not applicable rest on the registry count the producer states (no high-risk use case declared)', 'warn');
-
-  // 6. The summary recomputes from the statuses.
-  const applicable = listed.length - counts.out_of_scope;
-  const s = pack.summary ?? {};
-  const rate = applicable ? counts.covered / applicable : 0;
-  const summaryOk = s.total === listed.length && s.covered === counts.covered && s.partial === counts.partial && s.notCovered === counts.not_covered
-    && s.outOfScope === counts.out_of_scope && s.applicable === applicable && Math.abs((s.rate ?? -1) - rate) < 1e-9;
-  push('compliance.summary', summaryOk, summaryOk ? `${counts.covered} covered / ${applicable} applicable (${Math.round(rate * 100)} %)` : 'the summary does not recompute from the requirements');
-  return out;
-}
-
-return { matchesKind, verifyCompliancePack };
 })();
 M.platform = (() => {
 // SPDX-FileCopyrightText: 2026 Beweird SAS
@@ -1918,10 +1814,22 @@ function coverageOf(pack) {
   return { count: seqs.length, first: seqs.length ? Math.min(...seqs) : null, last: seqs.length ? Math.max(...seqs) : null };
 }
 
-/** Every sealed link a pack carries, wherever it sits: [{ seq, entryHash }]. */
+/** The time a link's core seals (`occurredAt`, its `core` — else its `coreCanonical` — read), or null. */
+function sealedAt(link) {
+  let core = link?.core && typeof link.core === 'object' ? link.core : null;
+  if (!core && typeof link?.coreCanonical === 'string') {
+    try { core = JSON.parse(link.coreCanonical); } catch { core = null; }
+  }
+  return typeof core?.occurredAt === 'string' ? core.occurredAt : null;
+}
+
+/**
+ * Every sealed link a pack carries, wherever it sits: [{ seq, entryHash, sealedAt }] (also Check 18's) — `sealedAt`
+ * the time its core seals, null when it seals none.
+ */
 function carried(pack) {
   const out = [];
-  const add = list => { for (const l of Array.isArray(list) ? list : []) out.push({ seq: Number(l?.seq), entryHash: l?.entryHash }); };
+  const add = list => { for (const l of Array.isArray(list) ? list : []) out.push({ seq: Number(l?.seq), entryHash: l?.entryHash, sealedAt: sealedAt(l) }); };
   add(pack?.entries); add(pack?.chain);
   for (const s of Array.isArray(pack?.segments) ? pack.segments : []) add(s?.links);
   add(pack?.impact?.entries); add(pack?.impact?.completeness?.links);
@@ -1931,6 +1839,7 @@ function carried(pack) {
 const range = c => (c.count ? (c.first === c.last ? `seq ${c.first}` : `seq ${c.first}–${c.last}`) : 'nothing');
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
+/** Format 2 claims' coverage is well formed — a dossier's signature, and a JSON pack's (Check 17). */
 function wellFormedV2(c) {
   const e = c?.entries;
   const head = c?.head;
@@ -1943,24 +1852,25 @@ function wellFormedV2(c) {
 
 /**
  * Format 2: what the signature committed, against evidence.json. FAILs when the pack does not hold
- * what was signed; else one PASS line saying plainly what the dossier covers.
+ * what was signed; else one PASS line saying plainly what the dossier covers. A JSON evidence pack's
+ * signature (Check 17) commits the same coverage: `file` and `whole` name it there, `id` its check.
  */
-function verifyCoverage(claims, pack) {
-  const push = (ok, detail, id = 'coverage') => [{ id, ok, detail }];
+function verifyCoverage(claims, pack, { id = 'coverage', file = 'evidence.json', whole = 'the dossier' } = {}) {
+  const push = (ok, detail) => [{ id, ok, detail }];
   const kind = kindOf(pack);
-  if (claims.kind !== kind) return push(false, `the signature is for a ${claims.kind} dossier; evidence.json is a ${kind} dossier`);
+  if (claims.kind !== kind) return push(false, `the signature is for a ${claims.kind} dossier; ${file} is a ${kind} dossier`);
   const got = coverageOf(pack);
   const want = claims.entries;
   if (got.count !== want.count || got.first !== want.first || got.last !== want.last) {
-    return push(false, `evidence.json lists ${plural(got.count, 'entry', 'entries')} (${range(got)}); the signature committed ${plural(want.count, 'entry', 'entries')} (${range(want)}) — entries were removed, added or renumbered after signing`);
+    return push(false, `${file} lists ${plural(got.count, 'entry', 'entries')} (${range(got)}); the signature committed ${plural(want.count, 'entry', 'entries')} (${range(want)}) — entries were removed, added or renumbered after signing`);
   }
   const links = carried(pack).filter(l => Number.isFinite(l.seq));
   const head = claims.head;
   if (!head) {
-    if (links.length) return push(false, `the signature says the journal was empty at export, but the dossier carries seq ${links[0].seq}`);
+    if (links.length) return push(false, `the signature says the journal was empty at export, but ${whole} carries seq ${links[0].seq}`);
   } else {
     const after = links.find(l => l.seq > head.seq);
-    if (after) return push(false, `the dossier carries seq ${after.seq}, after the chain's head the signature committed (seq ${head.seq})`);
+    if (after) return push(false, `${whole} carries seq ${after.seq}, after the chain's head the signature committed (seq ${head.seq})`);
     const atHead = links.find(l => l.seq === head.seq && l.entryHash !== head.hash);
     if (atHead) return push(false, `the entry at seq ${head.seq} is not the chain's head the signature committed (${head.hash.slice(0, 12)}…)`);
   }
@@ -2034,7 +1944,7 @@ function verifyDossierSignature(files, rootHash, { keys = null, pack = null } = 
   return out;
 }
 
-return { SIGNATURE_FILE, DOSSIER_KINDS, kindOf, coverageOf, verifyDossierSignature };
+return { SIGNATURE_FILE, DOSSIER_KINDS, kindOf, coverageOf, carried, wellFormedV2, verifyCoverage, verifyDossierSignature };
 })();
 M.pricing = (() => {
 // SPDX-FileCopyrightText: 2026 Beweird SAS
@@ -2324,6 +2234,702 @@ function verifyRetention(pack) {
 
 return { verifyRetention };
 })();
+M.headroot = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * azoth-verify — the hourly platform root (SPEC.md, Check 18).
+ *
+ * Every hour, Azoth puts the chain head of every journal that moved — each workspace's, and Azoth's own platform
+ * journal — into one Merkle tree, and one RFC 3161 token dates its root. A dossier ships, outside its manifest, the
+ * inclusion proof of a head it carries (`head-roots.json`, the root's token beside it). This check recomputes the
+ * leaf from the dossier's OWN workspace and link, walks the path to the root, and verifies the root's token as
+ * Check 4 does (timestamp.mjs): the head — and every entry the chain links before it — existed at the token's time,
+ * without trusting the producer.
+ *
+ * Then the dates (SPEC.md, Check 18 steps 4 and 5): a root's token can be dated neither before the hour its proof
+ * names, nor before an entry it covers was sealed, nor after the export signed the dossier — and one dated long after
+ * either is said. A dossier without `head-roots.json` is said too, when its signature states that the producer was
+ * dating journal heads by then, or that the export shipped one.
+ *
+ * Then, when the reader gives the roots the producer published (SPEC.md, Check 18 step 6 — a file saved from its
+ * /api/proof/head-roots, read here from disk: the verifier fetches nothing), each proof's root is compared with the
+ * root published for its hour: whoever holds the producer's database could rewrite a chain and root it again, but
+ * not the copy the reader already holds.
+ *
+ * The encoding is RFC 9162's (§2.1), written here from SPEC.md, not shared with the producer:
+ *   leaf data   UTF-8 of  "azoth.journal-head.v1" LF subject LF seq LF entryHash
+ *   leaf hash   SHA-256(0x00 || leaf data)        node hash   SHA-256(0x01 || left || right)
+ *   proof       the sibling hashes, deepest first, verified with the leaf's index and the tree's size (§2.1.3.2)
+ */
+const { concat, equal, fromBase64, fromHex, fromUtf8, hex, utf8 } = M.bytes;
+const { digest } = M.crypto;
+const { checkTimestamp, readPem } = M.timestamp;
+const { carried, kindOf, SIGNATURE_FILE } = M.signature;
+
+const HEAD_ROOTS_FILE = 'head-roots.json';
+/** The format of the roots a producer publishes (its /api/proof/head-roots answer), as `--published-roots` reads it. */
+const PUBLISHED_ROOTS_FORMAT = 'azoth.head-roots.published/1';
+const HEAD_LEAF_DOMAIN = 'azoth.journal-head.v1';
+const PLATFORM_SUBJECT = 'platform';
+
+const HOUR_MS = 3_600_000;
+/**
+ * How far a root's token time may fall on the wrong side of a time the producer wrote, without contradiction: the
+ * authority's clock against the producer's servers and database (each kept to UTC, but never exactly), plus the
+ * worker's run between the token and the record of its hour (one minute at most). Five minutes: every FAIL below is
+ * a contradiction no clock explains.
+ */
+const ROOT_CLOCK_TOLERANCE_MS = 5 * 60_000;
+/**
+ * A root is dated within minutes of its hour, and within the hour after the head it covers was sealed: the producer
+ * roots every hour. Dated more than two hours after either, it is late — an authority retried, a worker that did not
+ * run, or a head rooted again — and is said (a warning): it proves the head existed then, not earlier.
+ */
+const LATE_ROOT_MS = 2 * HOUR_MS;
+/**
+ * From this instant, every dossier an Azoth producer signs states the hourly roots (the claims' `roots`, Check 18 step
+ * 5): producers from version 0.14.1 on (2026-11-21) do, and none signs without it since. A dossier dated after it — by
+ * its signature, an entry it carries or a token it ships — whose signature states nothing was signed again without that
+ * statement, or by an older producer: said (SPEC.md, Check 18 step 5). Pinned here, never read from the dossier.
+ */
+const ROOTS_STATED_FROM = '2026-11-22T00:00:00.000Z';
+/**
+ * The producer roots every journal that moved at the next hour: a root dated two hours or more after an entry was sealed
+ * was made after it was appended (the journal's outbox lag included), so it dates a head at or after that entry
+ * (SPEC.md, Check 18 step 6).
+ */
+const ROOTED_WITHIN_MS = LATE_ROOT_MS;
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+const isSubject = s => s === PLATFORM_SUBJECT || UUID.test(String(s));
+
+/** The leaf hash of a journal head (SPEC.md, Check 18). Throws outside the encoding. */
+function headLeafHash(subject, seq, entryHash) {
+  if (!isSubject(subject)) throw new Error('the subject is a lowercase workspace id or "platform"');
+  if (!Number.isSafeInteger(seq) || seq < 1) throw new Error('seq is a positive integer');
+  if (!HEX64.test(String(entryHash))) throw new Error('entryHash is 64 lowercase hex characters');
+  return digest('sha256', concat(Uint8Array.of(0x00), utf8(`${HEAD_LEAF_DOMAIN}\n${subject}\n${seq}\n${entryHash}`)));
+}
+
+const headNodeHash = (left, right) => digest('sha256', concat(Uint8Array.of(0x01), left, right));
+
+/** The root an inclusion path leads to (RFC 9162 §2.1.3.2), or null when index, size and path cannot belong together. */
+function rootFromPath(leaf, index, size, path) {
+  if (!Number.isSafeInteger(index) || !Number.isSafeInteger(size) || index < 0 || index >= size) return null;
+  let fn = index;
+  let sn = size - 1;
+  let r = leaf;
+  for (const p of path) {
+    if (!(p instanceof Uint8Array) || p.length !== 32 || sn === 0) return null;
+    if (fn % 2 === 1 || fn === sn) {
+      r = headNodeHash(p, r);
+      if (fn % 2 === 0) while (fn % 2 === 0 && fn !== 0) { fn = Math.floor(fn / 2); sn = Math.floor(sn / 2); }
+    } else {
+      r = headNodeHash(r, p);
+    }
+    fn = Math.floor(fn / 2);
+    sn = Math.floor(sn / 2);
+  }
+  return sn === 0 ? r : null;
+}
+
+/** The claims of the dossier's signature.jws, unverified (Check 12 verifies them), or null when unreadable. */
+function claimsOf(files) {
+  try {
+    const claims = JSON.parse(fromUtf8(fromBase64(fromUtf8(files[SIGNATURE_FILE]).trim().split('.')[1])));
+    return claims && typeof claims === 'object' ? claims : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The instant the dossier was signed (its signature's `iat`, in milliseconds), or null when it states none. */
+function signedAt(files) {
+  const claims = claimsOf(files);
+  return Number.isInteger(claims?.iat) ? claims.iat * 1000 : null;
+}
+
+/** The journal the dossier is of: Azoth's platform journal, or the workspace its pack — else its signature — names. */
+function subjectOf(pack, claims) {
+  if (kindOf(pack) === 'platform') return PLATFORM_SUBJECT;
+  if (typeof pack?.workspaceId === 'string') return pack.workspaceId;
+  return typeof claims?.ws === 'string' ? claims.ws : null;
+}
+
+const iso = s => { const d = new Date(String(s)); return Number.isNaN(d.getTime()) ? String(s) : d.toISOString(); };
+const at = ms => new Date(ms).toISOString();
+const isHour = s => typeof s === 'string' && Number.isFinite(Date.parse(s)) && Date.parse(s) % HOUR_MS === 0;
+
+/** A duration as a reader says it: « 3 days », « 5 h 07 min ». */
+function span(ms) {
+  const m = Math.max(0, Math.round(ms / 60_000));
+  if (m >= 2 * 24 * 60) return `${Math.floor(m / (24 * 60))} days`;
+  return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min`;
+}
+
+/**
+ * The newest time sealed by a link the dossier carries at or before `seq` — what a head at `seq` vouches for, since
+ * every link commits to the one before it — or null when none of them seals its time.
+ * @param {Array<{ seq: number, sealedAt: string | null }>} links
+ */
+function newestSealed(links, seq = Infinity) {
+  let best = null;
+  for (const l of links) {
+    const ms = l.sealedAt ? Date.parse(l.sealedAt) : NaN;
+    if (l.seq <= seq && Number.isFinite(ms) && (!best || ms > best.ms)) best = { seq: l.seq, ms, sealedAt: l.sealedAt };
+  }
+  return best;
+}
+
+/**
+ * Check 18's dates for one root (SPEC.md, step 4), every time in milliseconds since the epoch: the token's `genTime`
+ * against the start of the `hour` its proof names, the `newest` entry it covers ({ seq, ms, sealedAt }, or null when
+ * none seals its time) and the instant the dossier was `signed` (its signature's `iat`, or null).
+ * @returns {{ fail: string | null, warns: string[] }}
+ */
+function rootDates({ genTime, hour, newest = null, signed = null }) {
+  const fails = [];
+  const warns = [];
+  const g = at(genTime);
+  if (!Number.isFinite(hour) || hour % HOUR_MS !== 0) {
+    fails.push('the proof’s hour is not the start of an hour (ISO 8601)');
+  } else if (genTime < hour - ROOT_CLOCK_TOLERANCE_MS) {
+    fails.push(`its token is dated ${g}, before the hour its proof names (${at(hour)}) began: it is not that hour’s root`);
+  } else if (genTime > hour + LATE_ROOT_MS) {
+    warns.push(`its token is dated ${g}, ${span(genTime - hour)} after the hour its proof names (${at(hour)}) began — dated late (its authority retried), or the proof’s hour is not the token’s`);
+  }
+  if (newest && genTime < newest.ms - ROOT_CLOCK_TOLERANCE_MS) {
+    fails.push(`its token is dated ${g}, before entry ${newest.seq} it covers was sealed (${newest.sealedAt}): a root cannot date an entry made after it`);
+  } else if (newest && genTime > newest.ms + LATE_ROOT_MS) {
+    warns.push(`it is dated ${span(genTime - newest.ms)} after the newest entry it covers (seq ${newest.seq}, sealed ${newest.sealedAt}) — rooted late: it proves the head existed at ${g}, not when its entries were sealed`);
+  }
+  if (signed !== null && Number.isFinite(signed) && genTime > signed + ROOT_CLOCK_TOLERANCE_MS) {
+    fails.push(`its token is dated ${g}, after the dossier was signed (${at(signed)}): the export that signed it cannot have shipped it — the proof was added later`);
+  }
+  return { fail: fails.length ? fails.join('; ') : null, warns };
+}
+
+/**
+ * What the signature says about the hourly roots (SPEC.md, Check 18 step 5), against the head-roots.json the dossier
+ * holds (or not). `roots` is absent from a producer that predates it — nothing is said then.
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>}
+ */
+function verifyRootsClaim(raw, claims, links) {
+  if (!claims || !Object.hasOwn(claims, 'roots')) return [];
+  const roots = claims.roots;
+  const id = 'head-roots';
+  if (roots !== null && !(roots && typeof roots === 'object' && isHour(roots.since) && (roots.proofs === null || HEX64.test(String(roots.proofs))))) {
+    return [{ id, ok: false, detail: `${SIGNATURE_FILE}: roots must be null or { since: the start of an hour (ISO 8601), proofs: a sha-256 hex or null }` }];
+  }
+  const shipped = roots?.proofs ?? null;
+  if (raw) {
+    if (shipped === null) return [{ id, ok: true, level: 'warn', detail: `the signature says the export shipped no ${HEAD_ROOTS_FILE}: this one was added after it — each proof in it is checked on its own` }];
+    const got = hex(digest('sha256', raw));
+    return got === shipped ? [] : [{ id, ok: false, detail: `${HEAD_ROOTS_FILE} is not the file the export shipped (the signature commits sha256 ${shipped.slice(0, 12)}…, this one is ${got.slice(0, 12)}…): it was changed after the export` }];
+  }
+  if (shipped !== null) {
+    return [{ id, ok: true, level: 'warn', detail: `the signature says the export shipped ${HEAD_ROOTS_FILE} (sha256 ${shipped.slice(0, 12)}…): it is missing — removed after the export, so nothing here dates the journal’s head outside the producer’s database; ask for the dossier as it was exported` }];
+  }
+  const newest = roots ? newestSealed(links) : null;
+  if (!newest || newest.ms < Date.parse(roots.since)) return [];
+  return [{ id, ok: true, level: 'warn', detail: `no hourly root dates this dossier: its newest entry (seq ${newest.seq}, sealed ${newest.sealedAt}) is later than ${iso(roots.since)}, when the producer began dating journal heads, but none of its links was a dated head when it was exported — outside the producer’s database, only anchor.tsr (when present) dates it` }];
+}
+
+/**
+ * When the dossier left its producer, as far as the dossier says (SPEC.md, Check 18 step 5): the later of its signature's
+ * `iat` and the time of its anchor.tsr (a token the export asks for right after it signs) — null when it states neither.
+ */
+function exportedAt(signed, anchorAt = null) {
+  const times = [signed, anchorAt].filter(t => t !== null && Number.isFinite(t));
+  return times.length ? Math.max(...times) : null;
+}
+
+/**
+ * Whether the signature had to state the roots (SPEC.md, Check 18 step 5): the dossier is dated at or after
+ * ROOTS_STATED_FROM — by its signature, the newest time a link it carries seals, or a token it ships.
+ */
+function statedFromBy({ signed, newest, tokenTimes }) {
+  const from = Date.parse(ROOTS_STATED_FROM);
+  const times = [signed, newest?.ms ?? null, ...tokenTimes].filter(t => t !== null && Number.isFinite(t));
+  const late = times.filter(t => t >= from);
+  return late.length ? Math.max(...late) : null;
+}
+
+/**
+ * What the signature had to state of the roots, and could not hide (SPEC.md, Check 18 step 5, verifier 2.4.0): a
+ * dossier dated after ROOTS_STATED_FROM whose signature states nothing; one that says the producer dated no head and
+ * that nothing else dates. Warnings: a producer older than that date signs no statement, and a deployment without a
+ * time-stamping authority dates nothing.
+ *   claims      the signature's claims (unverified here: Check 12 verifies them), or null
+ *   newest      the newest time a link the dossier carries seals ({ seq, ms, sealedAt }), or null
+ *   tokenTimes  the time of every token of the dossier that verifies (anchor.tsr, a root's, a journal head's)
+ *   dated       whether a token of the dossier verifies at all
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level: 'warn' }>}
+ */
+function verifyRootsStatement(claims, { newest = null, tokenTimes = [], dated = false } = {}) {
+  if (!claims) return [];
+  const signed = Number.isInteger(claims.iat) ? claims.iat * 1000 : null;
+  const after = statedFromBy({ signed, newest, tokenTimes });
+  if (after === null) return [];
+  const id = 'head-roots';
+  if (!Object.hasOwn(claims, 'roots')) {
+    return [{ id, ok: true, level: 'warn', detail: `the signature states nothing of the hourly roots, although the dossier is dated ${at(after)} — after ${ROOTS_STATED_FROM}, from when every Azoth producer states them in each dossier it signs: it was signed again without that statement, or by an older producer. Nothing says whether the producer was dating journal heads, nor whether a proof was removed: outside the producer’s database, only a token (anchor.tsr, a root’s) dates it` }];
+  }
+  if (claims.roots === null && !dated) {
+    return [{ id, ok: true, level: 'warn', detail: `the signature says the producer had dated no journal head when it exported this dossier, and nothing in it is dated by a third party (no anchor.tsr, no root’s token): what it holds and when it was signed are only the word of whoever holds the workspace’s key` }];
+  }
+  return [];
+}
+
+/** The published roots that hold a token the producer said was dated at or before `until` (ms). */
+const datedBy = (published, until) => published.filter(r => r.token && r.genTime !== null && r.genTime <= until);
+
+/**
+ * The roots the reader gave, against what the signature states and the head the dossier carries (SPEC.md, Check 18
+ * step 6, verifier 2.4.0) — whatever head-roots.json holds:
+ *   - the signature says the producer had dated no head (`roots: null`), or began at an hour later than one it had
+ *     published a root for, while that root was dated before the export: the producer's statements disagree (FAIL);
+ *   - the producer published a root dated two hours or more after the newest entry the dossier carries, and before the
+ *     export, but no proof at or after that entry holds: a FAIL when that entry is the journal's head the signature
+ *     commits and the published roots answer for every hour from its own to that root's, all of them dated before the
+ *     export — every journal that moves is a leaf of the next hourly root, so the export shipped its proof and it was
+ *     removed; else a warning (the entry was not a head when the root was made, or an hour is not answered for).
+ * @returns {Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }>}
+ */
+function verifyPublishedCoverage(claims, published, { newest = null, exported = null, rootedFrom = null } = {}) {
+  if (!claims || !published?.length || exported === null) return [];
+  const id = 'head-roots.published';
+  const out = [];
+  const before = datedBy(published, exported - ROOT_CLOCK_TOLERANCE_MS).sort((a, b) => a.hour - b.hour);
+  const roots = Object.hasOwn(claims, 'roots') ? claims.roots : undefined;
+  if (roots === null && before.length) {
+    const r = before[0];
+    out.push({ id, ok: false, detail: `the signature says the producer had dated no journal head when it exported this dossier (${at(exported)}), but it published a root of ${at(r.hour)} dated ${at(r.genTime)}: its statements disagree — the dossier was signed again, or the published copy is not the producer’s` });
+  } else if (roots && isHour(roots.since)) {
+    const earlier = before.find(r => r.hour < Date.parse(roots.since));
+    if (earlier) out.push({ id, ok: false, detail: `the signature says the producer began dating journal heads at ${iso(roots.since)}, but it published a root of ${at(earlier.hour)}, dated ${at(earlier.genTime)}, before this dossier was exported: its statements disagree — the dossier was signed again, or the published copy is not the producer’s` });
+  }
+  if (!newest) return out;
+  // A root dated two hours or more after the newest entry, and before the export, dates a head at or after it.
+  const after = before.filter(r => r.genTime >= newest.ms + ROOTED_WITHIN_MS);
+  if (!after.length || (rootedFrom !== null && rootedFrom >= newest.seq)) return out;
+  const first = after[0];
+  const own = Math.floor(newest.ms / HOUR_MS) * HOUR_MS;
+  const answered = h => published.some(r => r.window && r.window.from <= h && h <= r.window.to);
+  let whole = true;
+  for (let h = own; h <= first.hour && whole; h += HOUR_MS) {
+    const inHour = published.filter(r => r.hour === h);
+    whole = answered(h) && inHour.every(r => r.token && r.genTime !== null && r.genTime <= exported - ROOT_CLOCK_TOLERANCE_MS);
+  }
+  const head = claims.head && Number.isSafeInteger(claims.head.seq) ? claims.head.seq : null;
+  const root = `the root of ${at(first.hour)}, dated ${at(first.genTime)}`;
+  if (head === newest.seq && whole) {
+    out.push({ id, ok: false, detail: `the journal’s head when the dossier was exported — seq ${newest.seq}, sealed ${newest.sealedAt} — was dated by a root the producer published before the export (${root}, and every hour before it answered for): every journal that moves is a leaf of the next hourly root, so the export shipped the proof of its head — the dossier carries none that holds: removed after the export` });
+  } else {
+    out.push({ id, ok: true, level: 'warn', detail: `the producer published ${root} — two hours or more after the newest entry this dossier carries (seq ${newest.seq}, sealed ${newest.sealedAt}) and before it was exported — but no proof of the dossier dates that entry or a later one: ${head === newest.seq ? 'an hour between them is not answered for by the published roots given' : 'that entry was not the journal’s head when the export signed'}, or the proof was removed after the export` });
+  }
+  return out;
+}
+
+/**
+ * The roots a file saved from the producer's /api/proof/head-roots holds (SPEC.md, Check 18 step 6):
+ * `{ format: "azoth.head-roots.published/1", leaf, from, to, roots: [{ hour, root, treeSize, status, token, genTime }] }`.
+ * Returns `{ roots: [{ hour (ms), root, treeSize, token (bytes or null) }] }`, or `{ error }` when the file is not one.
+ * @param {Uint8Array | string} raw
+ */
+function readPublishedRoots(raw) {
+  let doc;
+  try { doc = JSON.parse(typeof raw === 'string' ? raw : fromUtf8(raw)); } catch { return { error: 'not JSON' }; }
+  if (doc?.format !== PUBLISHED_ROOTS_FORMAT || doc?.leaf !== HEAD_LEAF_DOMAIN || !Array.isArray(doc?.roots)) {
+    return { error: `not a list of published roots (format "${PUBLISHED_ROOTS_FORMAT}" of "${HEAD_LEAF_DOMAIN}" leaves)` };
+  }
+  // The hours the file answers for (its from and to): an hour inside them with no root had none — no journal moved.
+  const from = isHour(doc.from) ? Date.parse(doc.from) : null;
+  const to = isHour(doc.to) ? Date.parse(doc.to) : null;
+  const window = from !== null && to !== null && from <= to ? { from, to } : null;
+  const roots = [];
+  for (const [i, r] of doc.roots.entries()) {
+    const hour = isHour(r?.hour) ? Date.parse(r.hour) : NaN;
+    if (!Number.isFinite(hour) || !HEX64.test(String(r?.root)) || !Number.isSafeInteger(r?.treeSize) || r.treeSize < 1) {
+      return { error: `root ${i + 1}: an hour (the start of an hour, ISO 8601), a root (sha-256 hex) and a tree size (a positive integer)` };
+    }
+    let token = null;
+    if (r.token !== null && r.token !== undefined) {
+      try { token = typeof r.token === 'string' && r.token.length ? fromBase64(r.token) : null; } catch { token = null; }
+      if (!token) return { error: `root ${i + 1}: its token is not base64` };
+    }
+    // The token's time as the producer published it (its statement, compared with its other statements — never trust).
+    const g = typeof r.genTime === 'string' ? Date.parse(r.genTime) : NaN;
+    roots.push({ hour, root: r.root, treeSize: r.treeSize, token, genTime: token && Number.isFinite(g) ? g : null, window });
+  }
+  return { roots };
+}
+
+/** Two published copies of one hour's root that cannot both be the producer's: another root, size or token. */
+const disagree = (a, b) => a.root !== b.root || a.treeSize !== b.treeSize || (!!a.token && !!b.token && !equal(a.token, b.token));
+
+/**
+ * The roots the reader gave, against each other: one hour, one root. Two copies that disagree (files saved at
+ * different times) mean the producer changed a root it had published — said once per hour (a failure).
+ * @returns {Array<{ id: string, ok: boolean, detail: string }>}
+ */
+function publishedConflicts(published) {
+  const seen = new Map();
+  const hours = new Set();
+  for (const r of published) {
+    const first = seen.get(r.hour);
+    if (!first) seen.set(r.hour, r);
+    else if (disagree(first, r)) hours.add(r.hour);
+  }
+  return [...hours].sort((a, b) => a - b).map(h => ({
+    id: 'head-roots.published', ok: false,
+    detail: `the published roots given disagree on ${at(h)}: two different roots (or tokens) for one hour — the producer changed a root it had published`,
+  }));
+}
+
+/**
+ * Check 18 step 6 for one proof that holds: its root against the roots published for its hour. The same root and
+ * tree size (and token, when the copy holds one): a pass; another: a failure; none for that hour: not compared.
+ * @param {string} id  the proof's line (`head-root.<seq>`)
+ * @param {{ root: string, treeSize: number, hour: string }} proof
+ * @param {Uint8Array} token  the dossier's token of that root
+ * @param {Array<{ hour: number, root: string, treeSize: number, token: Uint8Array | null }>} published
+ * @returns {{ id: string, ok: boolean, detail: string, level?: 'warn' }}
+ */
+function comparePublished(id, proof, token, published) {
+  const hour = Date.parse(proof.hour);
+  const same = published.filter(r => r.hour === hour);
+  const line = `${id}.published`;
+  if (!same.length) {
+    return { id: line, ok: true, level: 'warn', detail: `not compared: the published roots given do not cover ${at(hour)} — save the producer's /api/proof/head-roots?from=${at(hour)}&to=${at(hour)} and give it with --published-roots` };
+  }
+  const other = same.find(r => r.root !== proof.root);
+  if (other) {
+    return { id: line, ok: false, detail: `the producer published another root for ${at(hour)} (${other.root.slice(0, 12)}…, ${other.treeSize} leaves) than the one this proof leads to (${String(proof.root).slice(0, 12)}…): the head was rooted again after the publication, or the proof is not the producer's` };
+  }
+  const size = same.find(r => r.treeSize !== Number(proof.treeSize));
+  if (size) return { id: line, ok: false, detail: `the root of ${at(hour)} was published with ${size.treeSize} leaves; the proof says ${Number(proof.treeSize)}` };
+  const tokened = same.filter(r => r.token);
+  if (tokened.some(r => !equal(r.token, token))) return { id: line, ok: false, detail: `the producer published another token for the root of ${at(hour)} than the one this dossier ships` };
+  return { id: line, ok: true, detail: `the root of ${at(hour)} is the one the producer published (${same[0].treeSize} leaves${tokened.length ? ', the same token' : ''}): it was not made again since` };
+}
+
+/**
+ * One proof of an hourly root (SPEC.md, Check 18 steps 1 to 4): the head is the dossier's, its path leads to the root,
+ * the root's token verifies (trusted only through a pinned root), its dates hold. Check 18 runs it on each proof of
+ * head-roots.json; Check 8 on each journal head a compliance bundle cites as rooted (`rootedHeads`, compliance.mjs).
+ *
+ *   p        `{ seq, entryHash?, subject?, leafIndex, treeSize, path, root, hour, token }` — head-roots.json's format
+ *   subject  the dossier's journal (a workspace id, or "platform"), never the proof's
+ *   hashes   the entry hash of each sealed link the dossier carries, by seq — the leaf is recomputed from it
+ *   links    those links with the time each seals ({ seq, sealedAt }, for newestSealed)
+ *   files    the dossier's files: the token, by name
+ *   chain    certificates the proof's producer ships to help build the authority's path (never trust)
+ *   signed   the instant the dossier was signed (ms), or null
+ *
+ * `passed`: steps 1 to 4 hold; `trusted`: the token's path ends on a pinned root (false without one); `token`: its
+ * bytes when step 3 was reached. Its lines are `<id>` and, when the root is late, `<id>.dates`.
+ * @returns {{ passed: boolean, trusted: boolean, genTime: Date | null, token: Uint8Array | null, checks: Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }> }}
+ */
+function verifyRootProof(p, { id, subject, hashes, links, files, shipped = [], chain = [], pinned = null, signed = null }) {
+  const no = detail => ({ passed: false, trusted: false, genTime: null, token: null, checks: [{ id, ok: false, detail }] });
+  const seq = Number(p?.seq);
+  if (!subject || !isSubject(subject)) return no('the dossier names no workspace whose journal the proof could be of');
+  if (typeof p?.subject === 'string' && p.subject !== subject) return no(`the proof is of ${p.subject}’s journal; the dossier is ${subject}’s`);
+  const entryHash = hashes.get(seq);
+  if (entryHash === undefined) return no(`seq ${p?.seq} is not one of the sealed links the dossier carries`);
+  if (p.entryHash !== undefined && p.entryHash !== entryHash) return no(`the proof names another hash for seq ${seq} than the dossier’s link`);
+  if (!HEX64.test(String(p.root)) || !Array.isArray(p.path) || !p.path.every(h => HEX64.test(String(h)))) return no('the proof’s root and path are sha-256 hex');
+  let leaf;
+  try { leaf = headLeafHash(subject, seq, entryHash); } catch (err) { return no(`the head cannot be a leaf: ${err.message}`); }
+  const r = rootFromPath(leaf, Number(p.leafIndex), Number(p.treeSize), p.path.map(h => fromHex(h)));
+  if (!r || !equal(r, fromHex(p.root))) return no(`the inclusion path of seq ${seq} does not lead to the root the token dates (proof altered, or another head)`);
+  const tsr = typeof p.token === 'string' ? files[p.token] : undefined;
+  if (!tsr) return no(`${p.token ?? 'the root’s token'} missing`);
+  const t = checkTimestamp(tsr, p.root, { shipped: [...shipped, ...chain], pinned, what: 'this root' });
+  if (!t.ok) return no(`the platform root of ${iso(p.hour)}: ${t.detail}`);
+  const dates = rootDates({ genTime: t.genTime.getTime(), hour: typeof p.hour === 'string' ? Date.parse(p.hour) : NaN, newest: newestSealed(links, seq), signed });
+  if (dates.fail) return no(`the platform root of ${iso(p.hour)}: ${dates.fail}`);
+  const journal = subject === PLATFORM_SUBJECT ? 'Azoth’s platform journal' : 'the workspace’s journal';
+  const where = `leaf ${Number(p.leafIndex) + 1} of ${Number(p.treeSize)} of the platform root of ${iso(p.hour)}`;
+  const checks = [];
+  const trusted = !!pinned && t.trusted;
+  if (pinned) {
+    checks.push(t.trusted
+      ? { id, ok: true, detail: `the head of ${journal} at seq ${seq} — and every entry the chain links before it — existed at ${t.genTime.toISOString()} (${t.tsa}): ${where}` }
+      : { id, ok: false, detail: 'the TSA chain of the platform root does not end on the root given with --tsa-root' });
+  } else {
+    checks.push({ id, ok: true, level: 'warn', detail: `the head of ${journal} at seq ${seq} existed at ${t.genTime.toISOString()} (${where}) — pin the TSA's root with --tsa-root to trust it` });
+  }
+  if (dates.warns.length) checks.push({ id: `${id}.dates`, ok: true, level: 'warn', detail: `the platform root of ${iso(p.hour)}: ${dates.warns.join('; ')}` });
+  return { passed: true, trusted, genTime: t.genTime, token: tsr, checks };
+}
+
+/**
+ * Check 18 over a dossier's files and its parsed evidence.json: each proof of head-roots.json, its dates, what the
+ * signature says — and had to say — about the roots and, with `published` (the roots readPublishedRoots read from the
+ * files the reader gave), each proof's root against the one published for its hour and the published roots against
+ * what the dossier states and carries (step 6). `anchorAt`: the time of the dossier's anchor.tsr when its token
+ * verifies (Check 4); `dated`: another token of the dossier verified (a journal head's, Check 5; a cited root's,
+ * Check 8). No head-roots.json, nothing the signature had to state and no published roots: no line.
+ * @returns {{ proofs: number, checks: Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }> }}
+ */
+function verifyHeadRoots(files, pack, { shipped = [], pinned = null, published = null, anchorAt = null, dated = false } = {}) {
+  const raw = files[HEAD_ROOTS_FILE];
+  const claims = claimsOf(files);
+  const links = carried(pack).filter(l => Number.isFinite(l.seq));
+  const newest = newestSealed(links);
+  const signed = Number.isInteger(claims?.iat) ? claims.iat * 1000 : null;
+  const checks = [...verifyRootsClaim(raw, claims, links), ...(published ? publishedConflicts(published) : [])];
+  const rooted = { times: [], top: null };
+  let proofs = 0;
+  if (raw) {
+    let doc;
+    try { doc = JSON.parse(fromUtf8(raw)); } catch { doc = null; }
+    if (doc?.v !== 1 || doc?.leaf !== HEAD_LEAF_DOMAIN || !Array.isArray(doc?.proofs) || doc.proofs.length === 0) {
+      checks.push({ id: 'head-root', ok: false, detail: `${HEAD_ROOTS_FILE} is not a version 1 list of proofs of "${HEAD_LEAF_DOMAIN}" leaves` });
+    } else {
+      proofs = doc.proofs.length;
+      const subject = subjectOf(pack, claims);
+      let chainCerts = [];
+      if (typeof doc.chain === 'string' && files[doc.chain]) {
+        try { chainCerts = readPem(fromUtf8(files[doc.chain])); } catch { chainCerts = []; }
+      }
+      const hashes = new Map(links.map(l => [l.seq, l.entryHash]));
+      for (const p of doc.proofs) {
+        const seq = Number(p?.seq);
+        const id = `head-root.${Number.isFinite(seq) ? seq : '?'}`;
+        const r = verifyRootProof(p, { id, subject, hashes, links, files, shipped, chain: chainCerts, pinned, signed });
+        checks.push(...r.checks);
+        if (!r.passed) continue;
+        rooted.times.push(r.genTime.getTime());
+        rooted.top = Math.max(rooted.top ?? seq, seq);
+        if (published) checks.push(comparePublished(id, p, r.token, published));
+      }
+    }
+  }
+  // Step 5: the export signs after it read what it lists — a signature older than an entry it carries was made again
+  // with its instant moved back — and what the signature had to state, whatever the dossier ships.
+  if (signed !== null && newest && signed < newest.ms - ROOT_CLOCK_TOLERANCE_MS) {
+    checks.push({ id: 'signature.dates', ok: false, detail: `the dossier says it was signed ${at(signed)}, before entry ${newest.seq} it carries was sealed (${newest.sealedAt}): an export signs what it has read — the signature’s instant was moved back` });
+  }
+  const tokenTimes = [...(anchorAt !== null ? [anchorAt] : []), ...rooted.times];
+  checks.push(...verifyRootsStatement(claims, { newest, tokenTimes, dated: dated || tokenTimes.length > 0 }));
+  // Step 6: the published roots against what the signature states and the head the dossier carries.
+  if (published) {
+    const covered = verifyPublishedCoverage(claims, published, { newest, exported: exportedAt(signed, anchorAt), rootedFrom: rooted.top });
+    checks.push(...covered);
+    if (!raw && !covered.length) checks.push({ id: 'head-roots.published', ok: true, level: 'warn', detail: `published roots given, but the dossier carries no ${HEAD_ROOTS_FILE}: nothing to compare` });
+  }
+  return { proofs, checks };
+}
+
+
+/** For callers that want the leaf as hex (tests, tooling). */
+const headLeafHex = (subject, seq, entryHash) => hex(headLeafHash(subject, seq, entryHash));
+
+return { HEAD_ROOTS_FILE, PUBLISHED_ROOTS_FORMAT, HEAD_LEAF_DOMAIN, PLATFORM_SUBJECT, ROOT_CLOCK_TOLERANCE_MS, LATE_ROOT_MS, ROOTS_STATED_FROM, ROOTED_WITHIN_MS, headLeafHash, headNodeHash, rootFromPath, signedAt, span, newestSealed, rootDates, verifyRootsClaim, exportedAt, verifyRootsStatement, verifyPublishedCoverage, readPublishedRoots, publishedConflicts, comparePublished, verifyRootProof, verifyHeadRoots, headLeafHex };
+})();
+M.compliance = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 8 — a compliance bundle (`evidence.json` kind "compliance", SPEC.md).
+ *
+ * The bundle says which requirements of a framework are covered by sealed
+ * evidence. This check makes that claim verifiable: the framework file (its
+ * requirements and the predicates of its evidence kinds) hashes to what the
+ * bundle names, every cited entry recomputes and matches the predicate of the
+ * kind it is cited for, and no requirement is marked covered unless each of its
+ * required groups has such an entry. Like the rest of the verifier it shares
+ * nothing with Azoth's code: the predicate rule is reimplemented from SPEC.md.
+ *
+ * A journal head the bundle cites as rooted (a kind of source `root`) is held to
+ * Check 18's proof, steps 1 to 4 (headroot.mjs): the leaf recomputed from the
+ * bundle's workspace and verified link, the path to the root, the root's token,
+ * its dates — trusted only through a pinned root.
+ */
+const { fromUtf8 } = M.bytes;
+const { sha256Hex, canonicalCore, entryCanonical, computeEntryHash, verifyLinks } = M.chain;
+const { checkTimestamp, readPem } = M.timestamp;
+const { signedAt, verifyRootProof } = M.headroot;
+const { carried } = M.signature;
+
+const bySeq = (a, b) => a.seq - b.seq;
+
+/** Does a sealed core count as evidence of this kind? (SPEC.md, Check 8, "Predicates".) */
+function matchesKind(kind, core) {
+  if (!kind || kind.source !== 'journal' || !core || typeof core !== 'object') return false;
+  const m = kind.match ?? {};
+  if (core.surface !== m.surface) return false;
+  const decision = typeof core.decision === 'string' ? core.decision : '';
+  const decisions = Array.isArray(m.decisions) ? m.decisions : [];
+  const prefixes = Array.isArray(m.decisionPrefixes) ? m.decisionPrefixes : [];
+  if ((decisions.length || prefixes.length) && !(decisions.includes(decision) || prefixes.some(p => decision.startsWith(p)))) return false;
+  const policy = core.policy && typeof core.policy === 'object' ? core.policy : {};
+  for (const [key, rule] of Object.entries(m.policy ?? {})) {
+    const v = policy[key];
+    if (rule && 'present' in rule ? v === undefined || v === null : v !== rule?.eq) return false;
+  }
+  for (const f of m.corePresent ?? []) if (core[f] === undefined || core[f] === null) return false;
+  return true;
+}
+
+function verifyCompliancePack(pack, files, { shipped = [], pinned = null } = {}) {
+  const out = [];
+  const push = (id, ok, detail, level) => out.push(level ? { id, ok, detail, level } : { id, ok, detail });
+  const dec = new TextDecoder();
+
+  // 1. The framework document the statuses were computed against.
+  let doc = null;
+  const fwBytes = files[pack.framework?.file];
+  if (!fwBytes) push('compliance.framework', false, `${pack.framework?.file ?? 'framework file'} missing`);
+  else if (sha256Hex(fwBytes) !== pack.framework.sha256) push('compliance.framework', false, `${pack.framework.file} does not hash to the framework hash the bundle names`);
+  else {
+    try { doc = JSON.parse(dec.decode(fwBytes)); } catch { doc = null; }
+    if (!doc?.framework || doc.framework.id !== pack.framework.id) { push('compliance.framework', false, 'the framework file is not the framework the bundle names'); doc = null; }
+    else push('compliance.framework', true, `${doc.framework.id} ${doc.framework.version}: ${doc.framework.requirements.length} requirements, the evidence kinds and every text, hashed`);
+  }
+  if (doc?.framework.mappingStatus !== 'validated') push('compliance.mapping', true, 'the mapping to the framework is marked as still to be validated by an expert', 'warn');
+  const disclaimed = typeof pack.disclaimer?.en === 'string' && pack.disclaimer.en.length > 0 && typeof pack.disclaimer?.fr === 'string' && pack.disclaimer.fr.length > 0;
+  push('compliance.disclaimer', disclaimed, disclaimed ? 'the bundle states it is a tool to prepare an audit, not a certification or legal advice' : 'the bundle carries no disclaimer');
+
+  // 2. The cited entries: recomputed, inside verified chain segments.
+  const segments = Array.isArray(pack.segments) ? pack.segments : [];
+  const entries = Array.isArray(pack.entries) ? [...pack.entries].sort(bySeq) : [];
+  const individual = pack.integrity?.inclusion === 'individual';
+  const at = new Map();
+  let broken = null;
+  for (const seg of segments) {
+    const links = [...(seg.links ?? [])].sort(bySeq);
+    const v = verifyLinks(links.map(l => ({ seq: l.seq, prevHash: l.prevHash, entryHash: l.entryHash, canonical: l.coreCanonical })));
+    if (!v.ok) { broken ??= `${v.reason} at seq ${v.brokenAt}`; continue; }
+    if (links[0]?.seq !== seg.fromSeq || links[links.length - 1]?.seq !== seg.toSeq) broken ??= `segment ${seg.fromSeq}–${seg.toSeq} does not hold its declared range`;
+    for (const l of links) at.set(l.seq, l);
+  }
+  const verified = new Map();
+  for (const e of entries) {
+    if (entryCanonical(e) === null || computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) { broken ??= `entry_hash mismatch (cited entry altered) at seq ${e.seq}`; continue; }
+    const l = at.get(e.seq);
+    if (!individual && (!l || l.entryHash !== e.entryHash || l.prevHash !== e.prevHash)) { broken ??= `entry ${e.seq} is not in a verified chain segment`; continue; }
+    verified.set(e.seq, e);
+  }
+  push('compliance.chain', !broken, broken ?? `${verified.size} cited sealed entries${individual ? ', each verified on its own' : `, in ${segments.length} verified chain segment(s)`}`);
+
+  for (const seg of segments) {
+    if (!seg.anchor) continue;
+    const last = at.get(seg.toSeq);
+    const tsr = files[seg.anchor.file];
+    if (!tsr || !last) { push(`compliance.anchor.${seg.toSeq}`, false, `${seg.anchor.file} missing`); continue; }
+    const t = checkTimestamp(tsr, last.entryHash, { shipped, pinned });
+    if (!t.ok) push(`compliance.anchor.${seg.toSeq}`, false, `journal head ${seg.toSeq}: ${t.detail}`);
+    else if (pinned) push(`compliance.anchor.${seg.toSeq}`, t.trusted, t.trusted ? `entries up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} (${t.tsa})` : 'the TSA chain does not end on the root given with --tsa-root');
+    else push(`compliance.anchor.${seg.toSeq}`, true, `entries up to seq ${seg.toSeq} existed at ${t.genTime.toISOString()} — pin the TSA's root with --tsa-root to trust it`, 'warn');
+  }
+
+  // 3. Timestamped journal heads cited as evidence.
+  const heads = new Set();
+  for (const h of Array.isArray(pack.heads) ? pack.heads : []) {
+    const link = at.get(h.journalSeq);
+    const tsr = files[h.file];
+    if (!link || !tsr) { push(`compliance.head.${h.journalSeq}`, false, `head ${h.journalSeq}: ${tsr ? 'its link is not in the bundle' : `${h.file} missing`}`); continue; }
+    const t = checkTimestamp(tsr, link.entryHash, { shipped, pinned });
+    if (!t.ok) { push(`compliance.head.${h.journalSeq}`, false, `head ${h.journalSeq}: ${t.detail}`); continue; }
+    heads.add(h.journalSeq);
+  }
+
+  // 3b. Journal heads in an hourly platform root, cited as evidence: each proof as Check 18 holds one, on the
+  //     bundle's own workspace and verified links; with --tsa-root, a root whose path ends elsewhere counts nothing.
+  const rooted = new Set();
+  const proofs = Array.isArray(pack.rootedHeads) ? pack.rootedHeads : [];
+  if (proofs.length) {
+    let chain = [];
+    if (typeof pack.rootChain === 'string' && files[pack.rootChain]) {
+      try { chain = readPem(fromUtf8(files[pack.rootChain])); } catch { chain = []; }
+    }
+    const hashes = new Map([...at].map(([seq, l]) => [seq, l.entryHash]));
+    const links = carried(pack).filter(l => at.get(l.seq)?.entryHash === l.entryHash);
+    const signed = signedAt(files);
+    for (const p of proofs) {
+      const seq = Number(p?.seq);
+      const r = verifyRootProof(p, {
+        id: `compliance.root.${Number.isFinite(seq) ? seq : '?'}`, subject: typeof pack.workspaceId === 'string' ? pack.workspaceId : null,
+        hashes, links, files, shipped, chain, pinned, signed,
+      });
+      out.push(...r.checks);
+      if (r.passed && (!pinned || r.trusted)) rooted.add(seq);
+    }
+  }
+
+  if (!doc) return out;
+  const kinds = new Map((doc.kinds ?? []).map(k => [k.id, k]));
+  const reqs = new Map(doc.framework.requirements.map(r => [r.id, r]));
+  const listed = Array.isArray(pack.requirements) ? pack.requirements : [];
+
+  // 4. Every citation is evidence of the kind it is cited for.
+  const valid = new Map();   // kind id → number of valid citations, per requirement key
+  let bad = null;
+  for (const r of listed) {
+    for (const [kindId, ev] of Object.entries(r.evidence ?? {})) {
+      const k = kinds.get(kindId);
+      const cited = Array.isArray(ev?.cited) ? ev.cited : [];
+      if (!k) { bad ??= `${r.id}: kind ${kindId} is not in the framework file`; continue; }
+      if (k.source === 'external' && (cited.length || ev.sealed)) { bad ??= `${r.id}: ${kindId} is what only the organisation provides — it cannot be counted as sealed`; continue; }
+      if (cited.length > (ev.sealed ?? 0)) { bad ??= `${r.id}: more ${kindId} entries cited than counted`; continue; }
+      let n = 0;
+      for (const seq of cited) {
+        if (k.source === 'anchor') { if (heads.has(seq)) n++; else bad ??= `${r.id}: head ${seq} cited as ${kindId} is not a verified timestamped head`; continue; }
+        if (k.source === 'root') { if (rooted.has(seq)) n++; else bad ??= `${r.id}: head ${seq} cited as ${kindId} is not a verified head of an hourly root`; continue; }
+        const e = verified.get(seq);
+        if (!e) bad ??= `${r.id}: entry ${seq} cited as ${kindId} is not a verified entry of the bundle`;
+        else if (!matchesKind(k, e.core)) bad ??= `${r.id}: entry ${seq} is not evidence of ${kindId}`;
+        else n++;
+      }
+      valid.set(`${r.id}\u0000${kindId}`, n);
+    }
+  }
+  push('compliance.citations', !bad, bad ?? 'every cited entry is evidence of the kind it is cited for');
+
+  // 5. No requirement is covered without evidence for each required group.
+  let inflated = null;
+  const missingReq = [...reqs.keys()].filter(id => !listed.some(r => r.id === id));
+  if (missingReq.length) inflated = `requirements left out of the bundle: ${missingReq.join(', ')}`;
+  const counts = { covered: 0, partial: 0, not_covered: 0, out_of_scope: 0 };
+  for (const r of listed) {
+    const req = reqs.get(r.id);
+    if (!req) { inflated ??= `${r.id} is not a requirement of the framework`; continue; }
+    counts[r.status] = (counts[r.status] ?? 0) + 1;
+    const groupHas = g => g.some(kindId => (valid.get(`${r.id}\u0000${kindId}`) ?? 0) > 0);
+    if (r.status === 'covered' && !req.required.every(groupHas)) inflated ??= `${r.id} is marked covered without verified evidence for each required group`;
+    if (r.status === 'out_of_scope' && r.reason === 'declared_out_of_scope') {
+      const s = (pack.scope ?? []).find(x => x.requirementId === r.id);
+      const e = s?.seq != null ? verified.get(s.seq) : null;
+      const p = e?.core?.policy ?? {};
+      const ok = e && e.core.surface === 'governance' && e.core.decision === 'compliance_scope_declared'
+        && p.requirementId === r.id && p.frameworkId === pack.framework.id && p.justificationHash === s.justificationHash;
+      if (!ok) inflated ??= `${r.id} is declared out of scope without its sealed declaration`;
+    }
+    if (r.status === 'out_of_scope' && r.reason === 'not_applicable' && !(req.applicability === 'high_risk' && pack.context?.highRiskUseCases === 0)) {
+      inflated ??= `${r.id} is marked not applicable, which its framework does not allow here`;
+    }
+  }
+  push('compliance.coverage', !inflated, inflated ?? `${counts.covered} requirement(s) covered, each on cited sealed evidence for every required group`);
+  if (listed.some(r => r.reason === 'not_applicable')) push('compliance.applicability', true, 'requirements marked not applicable rest on the registry count the producer states (no high-risk use case declared)', 'warn');
+
+  // 6. The summary recomputes from the statuses.
+  const applicable = listed.length - counts.out_of_scope;
+  const s = pack.summary ?? {};
+  const rate = applicable ? counts.covered / applicable : 0;
+  const summaryOk = s.total === listed.length && s.covered === counts.covered && s.partial === counts.partial && s.notCovered === counts.not_covered
+    && s.outOfScope === counts.out_of_scope && s.applicable === applicable && Math.abs((s.rate ?? -1) - rate) < 1e-9;
+  push('compliance.summary', summaryOk, summaryOk ? `${counts.covered} covered / ${applicable} applicable (${Math.round(rate * 100)} %)` : 'the summary does not recompute from the requirements');
+  return out;
+}
+
+return { matchesKind, verifyCompliancePack };
+})();
 M.verify = (() => {
 // SPDX-FileCopyrightText: 2026 Beweird SAS
 // SPDX-License-Identifier: Apache-2.0
@@ -2336,7 +2942,7 @@ M.verify = (() => {
  * reimplemented from SPEC.md (which documents, but does not import, the
  * producer's decision journal). A cross-import would annul the evidentiary value.
  */
-const { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, verifyLinks, bySeq } = M.chain;
+const { sha256Hex, canonicalCore, entryCanonical, computeEntryHash, computeRootHash, verifyLinks, bySeq } = M.chain;
 const { checkTimestamp, readPem } = M.timestamp;
 const { verifyIncidentPack } = M.incident;
 const { verifyCompliancePack } = M.compliance;
@@ -2347,6 +2953,7 @@ const { verifyFootprintPack } = M.footprint;
 const { verifyHoldDesignation } = M.litigation;
 const { verifyDossierSignature } = M.signature;
 const { verifyRetention } = M.retention;
+const { verifyHeadRoots, signedAt, span, LATE_ROOT_MS } = M.headroot;
 
 // The chain primitives, for callers of the verifier's main module (chain.mjs holds them).
 
@@ -2359,6 +2966,9 @@ const { verifyRetention } = M.retention;
  */
 function verifyChain(pack) {
   const listed = Array.isArray(pack?.entries) ? [...pack.entries].sort(bySeq) : [];
+  // An entry that carries its coreCanonical beside its core must state the core sealed (entryCanonical).
+  const restated = listed.find(e => entryCanonical(e) === null);
+  if (restated) return { ok: false, brokenAt: restated.seq, reason: 'its core is not the one its coreCanonical seals (listed entry altered)', verified: 0 };
   if (!Array.isArray(pack?.chain)) {
     return verifyLinks(listed.map(e => ({ seq: e.seq, prevHash: e.prevHash, entryHash: e.entryHash, canonical: canonicalCore(e.core) })));
   }
@@ -2376,6 +2986,18 @@ function verifyChain(pack) {
     }
   }
   return { ...seg, listed: listed.length };
+}
+
+/**
+ * Check 3's line: the chain of an audit pack (a journal export, as a dossier's evidence.json or as the
+ * signed JSON pack of Check 17), with the segment it holds and the listed decisions in it.
+ * @returns {{ id: 'chain', ok: boolean, detail: string }}
+ */
+function chainCheck(pack) {
+  const v = verifyChain(pack);
+  const segment = v.ok && v.first > 1 ? `, seq ${v.first}–${v.last}, attached to prev_hash ${String(v.startPrevHash).slice(0, 12)}…` : '';
+  const listed = v.ok && v.listed !== undefined ? `; the ${v.listed} listed decisions are in it` : '';
+  return { id: 'chain', ok: v.ok, detail: v.ok ? `chain intact (${v.verified} sealed decisions${segment})${listed}` : `${v.reason} at seq ${v.brokenAt}` };
 }
 
 /**
@@ -2423,7 +3045,8 @@ function verifyDecisionPack(pack, files, { shipped = [], pinned = null } = {}) {
   }
   for (const e of entries) {
     if (broken) break;
-    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (listed entry altered) at seq ${e.seq}`;
+    if (entryCanonical(e) === null) broken = `entry ${e.seq}: its core is not the one its coreCanonical seals`;
+    else if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (listed entry altered) at seq ${e.seq}`;
     else if (!belongs(e)) broken = litigation ? `entry ${e.seq} is neither designated by this hold nor one of its acts`
       : exhaustion ? `entry ${e.seq} is not an act of this exhaustion incident`
         : footprint ? `entry ${e.seq} is not this AI footprint statement's act` : `entry ${e.seq} does not carry this dossier's decision reference`;
@@ -2553,7 +3176,9 @@ function verifySealedFields(pack) {
  * timestamp whose signature holds is reported with a warning: its chain can
  * only end on certificates the dossier itself ships.
  * @param {Record<string, Uint8Array>} files
- * @param {{ tsaRootPem?: string, vaultContents?: Array<{ name: string, bytes: Uint8Array }>, keys?: { keys?: unknown[] } | null }} [opts]
+ * `publishedRoots`: the roots the producer published (readPublishedRoots over the files given with
+ * --published-roots), each proof of head-roots.json compared with the one of its hour (Check 18, step 6).
+ * @param {{ tsaRootPem?: string, vaultContents?: Array<{ name: string, bytes: Uint8Array }>, keys?: { keys?: unknown[] } | null, publishedRoots?: Array<{ hour: number, root: string, treeSize: number, token: Uint8Array | null }> | null }} [opts]
  * @returns {{ ok: boolean, checks: Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }> }}
  */
 function verifyDossier(files, opts = {}) {
@@ -2617,10 +3242,7 @@ function verifyDossier(files, opts = {}) {
         if (pack.kind === 'ai_footprint') for (const c of verifyFootprintPack(pack)) checks.push(c);
         headTokens = (pack.segments ?? []).filter(seg => seg.anchor).length + (pack.heads ?? []).length;
       } else {
-        const v = verifyChain(pack);
-        const segment = v.ok && v.first > 1 ? `, seq ${v.first}–${v.last}, attached to prev_hash ${String(v.startPrevHash).slice(0, 12)}…` : '';
-        const listed = v.ok && v.listed !== undefined ? `; the ${v.listed} listed decisions are in it` : '';
-        push('chain', v.ok, v.ok ? `chain intact (${v.verified} sealed decisions${segment})${listed}` : `${v.reason} at seq ${v.brokenAt}`);
+        checks.push(chainCheck(pack));
       }
       // 15. Where the kept chain starts once the journal retention removed its oldest prefix.
       if (pack.kind !== 'platform' && pack.kind !== 'risk_profile' && pack.kind !== 'regulator') for (const c of verifyRetention(pack)) checks.push(c);
@@ -2635,17 +3257,32 @@ function verifyDossier(files, opts = {}) {
     }
   }
 
-  // 4. Trusted timestamp (anchor.tsr, RFC 3161) over the manifest root_hash.
+  // 4. Trusted timestamp (anchor.tsr, RFC 3161) over the manifest root_hash — read first: Check 18 dates the export by it.
   const tsr = files['anchor.tsr'];
-  if (!tsr) {
-    if (opts.tsaRootPem && !headTokens) push('timestamp', false, '--tsa-root given, but the dossier carries no RFC 3161 token');
+  const anchor = tsr ? checkTimestamp(tsr, String(manifest.root_hash ?? ''), { shipped, pinned }) : null;
+
+  // 18. The hourly platform root a head of the dossier is a leaf of (head-roots.json, outside the manifest), and what
+  //     the signature had to state of the roots.
+  const citedRoots = checks.filter(c => c.ok && /^compliance\.root\./.test(c.id)).length;
+  const rooted = verifyHeadRoots(files, pack, {
+    shipped, pinned, published: opts.publishedRoots ?? null,
+    anchorAt: anchor?.ok ? anchor.genTime.getTime() : null, dated: headTokens > 0 || citedRoots > 0,
+  });
+  for (const c of rooted.checks) checks.push(c);
+
+  if (!anchor) {
+    if (opts.tsaRootPem && !headTokens && !rooted.proofs) push('timestamp', false, '--tsa-root given, but the dossier carries no RFC 3161 token');
   } else {
-    const t = checkTimestamp(tsr, String(manifest.root_hash ?? ''), { shipped, pinned });
-    push('timestamp', t.ok, t.detail);
-    if (t.ok && pinned) {
-      push('timestamp.root', t.trusted, t.trusted ? `chain ends on the pinned root (${t.root})` : 'the TSA chain does not end on the root given with --tsa-root');
-    } else if (t.ok) {
-      push('timestamp.root', true, `chain ends on ${t.root}, shipped in the dossier — pin the TSA's own root with --tsa-root <pem>`, 'warn');
+    push('timestamp', anchor.ok, anchor.detail);
+    if (anchor.ok && pinned) {
+      push('timestamp.root', anchor.trusted, anchor.trusted ? `chain ends on the pinned root (${anchor.root})` : 'the TSA chain does not end on the root given with --tsa-root');
+    } else if (anchor.ok) {
+      push('timestamp.root', true, `chain ends on ${anchor.root}, shipped in the dossier — pin the TSA's own root with --tsa-root <pem>`, 'warn');
+    }
+    // The export asks for anchor.tsr the moment it signs: a token dated long after the signature was added later.
+    const signed = signedAt(files);
+    if (anchor.ok && signed !== null && anchor.genTime.getTime() > signed + LATE_ROOT_MS) {
+      push('timestamp.dates', true, `anchor.tsr is dated ${anchor.genTime.toISOString()}, ${span(anchor.genTime.getTime() - signed)} after the dossier was signed (${new Date(signed).toISOString()}): the export timestamps the manifest the moment it signs it, so this token was added later — it proves the dossier existed at ${anchor.genTime.toISOString()}, not when it was signed`, 'warn');
     }
   }
 
@@ -2656,7 +3293,7 @@ function verifyDossier(files, opts = {}) {
   return { ok: allFilesOk && rootOk && checks.every(c => c.ok), checks };
 }
 
-return { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, verifyLinks, verifyChain, verifyDecisionPack, verifyVaultContents, verifySealedFields, verifyDossier };
+return { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, verifyLinks, verifyChain, chainCheck, verifyDecisionPack, verifyVaultContents, verifySealedFields, verifyDossier };
 })();
 M.receipt = (() => {
 // SPDX-FileCopyrightText: 2026 Beweird SAS
@@ -2747,6 +3384,157 @@ function verifyReceipt(token, jwks, { pack = null } = {}) {
 
 return { decodeReceipt, verifyReceipt };
 })();
+M.export = (() => {
+// SPDX-FileCopyrightText: 2026 Beweird SAS
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Check 17 — a signed JSON evidence pack (SPEC.md): the body Azoth answers to
+ * `GET /api/v1/journal/export` (without `format=dossier`) and its `X-Azoth-Export-Signature` header,
+ * a compact JWS (EdDSA) by the workspace's Ed25519 key over the sha256 of that exact body and the
+ * coverage it commits — the dossier's (Check 12), with the body in place of the manifest's root.
+ *
+ * The body is read as the bytes received: re-indented, re-encoded or re-serialised, it is another body,
+ * and fails. The key must be one the reader pinned (`--keys`): the pack ships no key of its own. Then
+ * the pack is the audit pack a dossier's evidence.json is — its chain (Check 3), the retention
+ * checkpoint it starts after (Check 15), the law and the cost decided again from the seals (Checks 11
+ * and 13, without the files only a dossier ships), the time, actor type and trace each core seals
+ * (Check 16).
+ *
+ * Zero dependencies, zero network, no Azoth code: the rules are SPEC.md's, reimplemented here; the
+ * cryptography is crypto.mjs's (node:crypto, or the web verifier's), the key rules keys.mjs's.
+ */
+const { sha256Hex } = M.chain;
+const { base64url, bytesOf, fromBase64, fromUtf8, utf8 } = M.bytes;
+const { digest, verifyEd25519 } = M.crypto;
+const { keyTrustAt } = M.keys;
+const { kindOf, verifyCoverage, wellFormedV2 } = M.signature;
+const { chainCheck, verifySealedFields } = M.verify;
+const { verifyRetention } = M.retention;
+const { verifyJurisdiction } = M.jurisdiction;
+const { verifyPricing } = M.pricing;
+
+const EXPORT_SIGNATURE_HEADER = 'X-Azoth-Export-Signature';
+const TYP = 'azoth-journal-export+jws';
+const B64URL = /^[A-Za-z0-9_-]+$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+const json = part => JSON.parse(fromUtf8(fromBase64(part)));
+const isScalar = v => v === null || ['string', 'number', 'boolean'].includes(typeof v);
+
+/**
+ * The signature as given: the token itself, or a text that holds it — the header line as `curl -D`
+ * writes it (`X-Azoth-Export-Signature: <token>`), any case.
+ */
+function exportSignatureOf(text) {
+  const s = String(text ?? '');
+  const line = new RegExp(`^${EXPORT_SIGNATURE_HEADER}:[ \\t]*(\\S+)`, 'im').exec(s);
+  return (line ? line[1] : s).trim();
+}
+
+/**
+ * The export's filters as it signed them (the producer's rule): scalars kept, a list joined with ",",
+ * an object or an absent value dropped.
+ */
+function signedFilters(filters) {
+  const out = {};
+  for (const [k, v] of Object.entries(filters && typeof filters === 'object' ? filters : {})) {
+    if (Array.isArray(v)) out[k] = v.map(String).join(',');
+    else if (isScalar(v)) out[k] = v;
+  }
+  return out;
+}
+/** The same names with the same values, in whatever order. */
+const sameFilters = (a, b) => {
+  const names = Object.keys(a);
+  return names.length === Object.keys(b).length && names.every(k => Object.prototype.hasOwnProperty.call(b, k) && Object.is(a[k], b[k]));
+};
+
+/**
+ * Check 17. `body`: the pack's bytes as received (or its text). `signature`: the header's value.
+ * `keys`: the workspace's published keys (a JWKS), pinned by the reader. `workspace`: the workspace the
+ * reader fetched the keys for (`--workspace`), when the JWKS does not name it.
+ * @param {Uint8Array | string} body
+ * @param {string} signature
+ * @param {{ keys?: { keys?: unknown[], workspaceId?: unknown } | null, workspace?: string | null }} [opts]
+ * @returns {{ ok: boolean, checks: Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }> }}
+ */
+function verifyExport(body, signature, { keys = null, workspace = null } = {}) {
+  const checks = [];
+  const push = (id, ok, detail, level) => checks.push(level ? { id, ok, detail, level } : { id, ok, detail });
+  const done = () => ({ ok: checks.every(c => c.ok), checks });
+
+  // 1. The signature's form.
+  const token = exportSignatureOf(signature);
+  const parts = token.split('.');
+  if (parts.length !== 3 || !parts.every(p => B64URL.test(p))) { push('export.format', false, `the ${EXPORT_SIGNATURE_HEADER} value is not a compact JWS (three base64url parts)`); return done(); }
+  let header; let claims;
+  try { header = json(parts[0]); claims = json(parts[1]); } catch { push('export.format', false, 'the signature\'s header or claims are not JSON'); return done(); }
+  if (header?.alg !== 'EdDSA' || header?.typ !== TYP || typeof header?.kid !== 'string') { push('export.format', false, `the signature's header must be { alg: "EdDSA", typ: "${TYP}", kid }`); return done(); }
+  if (claims?.v !== 1 || typeof claims?.ws !== 'string' || !HEX64.test(String(claims?.body)) || !Number.isInteger(claims?.iat) || !wellFormedV2(claims)) {
+    push('export.format', false, 'the claims must be { v: 1, ws, body: sha256 hex, iat: seconds, kind, head ({ seq, hash } or null), entries ({ count, first, last }), filters (scalars) }');
+    return done();
+  }
+  const when = new Date(claims.iat * 1000).toISOString();
+  push('export.format', true, `a JSON evidence pack signature for workspace ${claims.ws}, made ${when}`);
+
+  // 2. The body is the one signed, byte for byte.
+  const bytes = bytesOf(body);
+  const got = sha256Hex(bytes);
+  push('export.body', got === claims.body, got === claims.body
+    ? `the body is the one signed (sha256 ${got.slice(0, 12)}…, ${bytes.length} bytes)`
+    : `the body is not the one signed: its sha256 is ${got.slice(0, 12)}…, the signature committed ${claims.body.slice(0, 12)}… — changed, re-indented or re-encoded after it was answered (keep the body exactly as received)`);
+
+  // 3. Signed by a key the reader pinned, which may sign at that instant (keys.mjs, keyTrustAt).
+  const published = `the keys Azoth publishes for this workspace (/api/proof/keys/${claims.ws})`;
+  if (!keys) { push('export.signature', false, `no keys given: the pack ships none, so its signature is checked only against keys you pin — give ${published} with --keys`); return done(); }
+  const key = (Array.isArray(keys?.keys) ? keys.keys : []).find(k => k?.kid === header.kid);
+  if (!key || key.kty !== 'OKP' || key.crv !== 'Ed25519' || typeof key.x !== 'string') {
+    push('export.signature', false, `no Ed25519 key ${header.kid} among the keys given (${published})`);
+    return done();
+  }
+  // The kid is the key's RFC 7638 thumbprint: a key cannot be swapped under the same id.
+  const thumbprint = base64url(digest('sha256', utf8(JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: key.x }))));
+  if (thumbprint !== header.kid) { push('export.signature', false, `key ${header.kid} does not hash to its id`); return done(); }
+  let valid = false;
+  try { valid = verifyEd25519(key.x, utf8(`${parts[0]}.${parts[1]}`), fromBase64(parts[2])); } catch { valid = false; }
+  if (!valid) { push('export.signature', false, 'the signature does not verify (claims altered, or another key)'); return done(); }
+  const trust = keyTrustAt(key, claims.iat);
+  if (!trust.ok) { push('export.signature', false, `key ${header.kid.slice(0, 12)}… is refused: ${trust.detail}`); return done(); }
+  push('export.signature', true, `signed by the workspace's key ${header.kid.slice(0, 12)}… on ${when}, among the keys given`);
+  if (trust.warn) push('export.signature.key', true, `key ${header.kid.slice(0, 12)}…: ${trust.warn}`, 'warn');
+
+  // 4. Whose: the pack's workspace, the keys', the reader's.
+  let pack = null;
+  try { pack = JSON.parse(fromUtf8(bytes)); } catch { pack = null; }
+  if (!pack || typeof pack !== 'object' || Array.isArray(pack)) { push('export.pack', false, 'the body is not a JSON evidence pack'); return done(); }
+  // The workspace the keys name (a JWKS's `workspaceId`) and the one the reader names (--workspace), each held.
+  const pins = [];
+  if (typeof keys?.workspaceId === 'string') pins.push([keys.workspaceId, w => `the keys given are workspace ${w}’s`]);
+  if (typeof workspace === 'string' && workspace) pins.push([workspace, w => `the workspace you named is ${w}`]);
+  const off = pins.find(([w]) => w !== claims.ws);
+  if (pack.workspaceId !== claims.ws) push('export.workspace', false, `signed for workspace ${claims.ws}, but the pack is ${typeof pack.workspaceId === 'string' ? `workspace ${pack.workspaceId}’s` : 'no workspace’s'}`);
+  else if (off) push('export.workspace', false, `signed for workspace ${claims.ws}, but ${off[1](off[0])}`);
+  else if (pins.length) push('export.workspace', true, `workspace ${claims.ws}: the pack's, the signature's and the keys'`);
+  else push('export.workspace', true, `workspace ${claims.ws}: the pack's and the signature's — the keys given do not say whose they are; give --workspace with the workspace you fetched them for`, 'warn');
+
+  // 5. What the signature commits: the kind, the chain's head, the entries listed — and the filters.
+  const coverage = verifyCoverage(claims, pack, { id: 'export.coverage', file: 'the pack', whole: 'the pack' });
+  const filters = signedFilters(pack.filters);
+  if (coverage[0]?.ok && !sameFilters(filters, claims.filters)) push('export.coverage', false, 'the pack\'s filters are not the ones its signature committed');
+  else checks.push(...coverage);
+
+  // 6. The pack itself, as a dossier's evidence.json of an audit export (Checks 3, 15, 11, 13, 16).
+  if (kindOf(pack) === 'audit') {
+    checks.push(chainCheck(pack));
+    checks.push(...verifyRetention(pack));
+    checks.push(...verifyJurisdiction(pack.entries, {}));
+    checks.push(...verifyPricing(pack.entries, {}));
+    checks.push(...verifySealedFields(pack));
+  }
+  return done();
+}
+
+return { EXPORT_SIGNATURE_HEADER, exportSignatureOf, signedFilters, verifyExport };
+})();
 M.app = (() => {
 // SPDX-FileCopyrightText: 2026 Beweird SAS
 // SPDX-License-Identifier: Apache-2.0
@@ -2758,24 +3546,32 @@ M.app = (() => {
  */
 const { verifyDossier } = M.verify;
 const { verifyReceipt } = M.receipt;
+const { verifyExport } = M.export;
 const { readZip } = M.zip;
 const { fromUtf8 } = M.bytes;
+const { readPublishedRoots } = M.headroot;
 
 const TEXT = {
   en: {
-    title: 'Azoth verifier — offline', lead: 'Checks an evidence dossier, a receipt and their timestamps entirely in this page: nothing is sent anywhere — the page forbids itself any network access. The same rules as the azoth-verify command line (SPEC.md).',
+    title: 'Azoth verifier — offline', lead: 'Checks an evidence dossier, a signed evidence pack, a receipt and their timestamps entirely in this page: nothing is sent anywhere — the page forbids itself any network access. The same rules as the azoth-verify command line (SPEC.md).',
     dossier: 'Evidence dossier (.zip)', root: 'Root certificate of the time-stamping authority (PEM, optional) — to trust its timestamps',
-    receipt: 'Receipt (the X-Azoth-Receipt header, optional)', keys: 'The workspace\'s published keys (keys.jwks.json, from /api/proof/keys/<workspace> — for a platform package, /api/proof/platform-keys) — required: a dossier verifies only under a key you chose, never one it ships',
+    publishedRoots: 'The hourly roots the producer published (.json, saved from /api/proof/head-roots?from=<hour>&to=<hour> — optional, one file or more) — to check that the dossier\'s roots are the ones published then',
+    receipt: 'Receipt (the X-Azoth-Receipt header, optional)',
+    pack: 'Evidence pack (.json, from /api/v1/journal/export, saved exactly as received — optional)', packSignature: 'Its signature (the X-Azoth-Export-Signature header)',
+    keys: 'The workspace\'s published keys (keys.jwks.json, from /api/proof/keys/<workspace> — for a platform package, /api/proof/platform-keys) — required: a dossier verifies only under a key you chose, never one it ships',
     run: 'Verify', pass: 'PASS', warn: 'NOTE', fail: 'FAIL', ok: 'VERIFIED — everything is intact.', ko: 'FAILED — something does not verify.',
-    nothing: 'Choose a dossier, or paste a receipt.', noKeys: 'A receipt is checked against the workspace\'s keys: give a dossier that holds them, or keys.jwks.json.',
+    nothing: 'Choose a dossier or an evidence pack, or paste a receipt.', noKeys: 'A receipt is checked against the workspace\'s keys: give a dossier that holds them, or keys.jwks.json.',
     unreadable: 'Unreadable file: {e}', note: 'Each check\'s detail is in English, as in the specification.',
   },
   fr: {
-    title: 'Vérificateur Azoth — hors ligne', lead: 'Vérifie un dossier de preuve, un reçu et leurs horodatages entièrement dans cette page : rien n’est envoyé nulle part — la page s’interdit tout accès réseau. Les mêmes règles que la commande azoth-verify (SPEC.md).',
+    title: 'Vérificateur Azoth — hors ligne', lead: 'Vérifie un dossier de preuve, un pack de preuve signé, un reçu et leurs horodatages entièrement dans cette page : rien n’est envoyé nulle part — la page s’interdit tout accès réseau. Les mêmes règles que la commande azoth-verify (SPEC.md).',
     dossier: 'Dossier de preuve (.zip)', root: 'Certificat racine de l’autorité d’horodatage (PEM, facultatif) — pour faire confiance à ses horodatages',
-    receipt: 'Reçu (l’en-tête X-Azoth-Receipt, facultatif)', keys: 'Les clés publiées du workspace (keys.jwks.json, à l’adresse /api/proof/keys/<workspace> — pour un dossier de la plateforme, /api/proof/platform-keys) — requises : un dossier ne se vérifie que sous une clé que vous avez choisie, jamais sous celle qu’il apporte',
+    publishedRoots: 'Les racines horaires publiées par le producteur (.json, enregistré depuis /api/proof/head-roots?from=<heure>&to=<heure> — facultatif, un fichier ou plusieurs) — pour vérifier que les racines du dossier sont celles publiées alors',
+    receipt: 'Reçu (l’en-tête X-Azoth-Receipt, facultatif)',
+    pack: 'Pack de preuve (.json, de /api/v1/journal/export, enregistré tel que reçu — facultatif)', packSignature: 'Sa signature (l’en-tête X-Azoth-Export-Signature)',
+    keys: 'Les clés publiées du workspace (keys.jwks.json, à l’adresse /api/proof/keys/<workspace> — pour un dossier de la plateforme, /api/proof/platform-keys) — requises : un dossier ne se vérifie que sous une clé que vous avez choisie, jamais sous celle qu’il apporte',
     run: 'Vérifier', pass: 'OK', warn: 'À NOTER', fail: 'ÉCHEC', ok: 'VÉRIFIÉ — tout est intact.', ko: 'ÉCHEC — quelque chose ne se vérifie pas.',
-    nothing: 'Choisissez un dossier, ou collez un reçu.', noKeys: 'Un reçu se vérifie avec les clés du workspace : donnez un dossier qui les contient, ou keys.jwks.json.',
+    nothing: 'Choisissez un dossier ou un pack de preuve, ou collez un reçu.', noKeys: 'Un reçu se vérifie avec les clés du workspace : donnez un dossier qui les contient, ou keys.jwks.json.',
     unreadable: 'Fichier illisible : {e}', note: 'Le détail de chaque contrôle est en anglais, comme dans la spécification.',
   },
 };
@@ -2821,23 +3617,34 @@ async function run() {
   const rootFile = $('root').files?.[0];
   const keysFile = $('keys').files?.[0];
   const receipt = $('receipt').value.trim();
-  if (!dossierFile && !receipt) { say(t('nothing')); return; }
-  let files = null; let tsaRootPem; let jwks = null;
+  const packFile = $('pack').files?.[0];
+  const publishedFiles = [...($('publishedRoots').files ?? [])];
+  if (!dossierFile && !receipt && !packFile) { say(t('nothing')); return; }
+  let files = null; let tsaRootPem; let jwks = null; let packBody = null; let publishedRoots = null;
   try {
     if (dossierFile) files = readZip(await bytesOf(dossierFile));
+    if (packFile) packBody = await bytesOf(packFile);
     if (rootFile) tsaRootPem = fromUtf8(await bytesOf(rootFile));
     if (keysFile) jwks = JSON.parse(fromUtf8(await bytesOf(keysFile)));
     else if (files?.['keys.jwks.json']) jwks = JSON.parse(fromUtf8(files['keys.jwks.json']));
+    // The roots the producer published (Check 18, step 6): files the reader saved — the page fetches nothing.
+    for (const f of publishedFiles) {
+      const read = readPublishedRoots(await bytesOf(f));
+      if (read.error) throw new Error(`${f.name}: ${read.error}`);
+      publishedRoots = [...(publishedRoots ?? []), ...read.roots];
+    }
   } catch (err) { say(t('unreadable', { e: err?.message ?? String(err) })); return; }
 
   // Keys the reader chose are the ones pinned: the dossier's signature is checked against them too.
-  const checks = files ? [...verifyDossier(files, { tsaRootPem, keys: keysFile ? jwks : null }).checks] : [];
+  const checks = files ? [...verifyDossier(files, { tsaRootPem, keys: keysFile ? jwks : null, publishedRoots }).checks] : [];
   if (receipt) {
     if (!jwks) { say(t('noKeys')); return; }
     let pack = null;
     try { pack = files?.['evidence.json'] ? JSON.parse(fromUtf8(files['evidence.json'])) : null; } catch { pack = null; }
     checks.push(...verifyReceipt(receipt, jwks, { pack }));
   }
+  // A signed evidence pack (Check 17): only under the keys the reader chose — the pack ships none.
+  if (packBody) checks.push(...verifyExport(packBody, $('packSignature').value, { keys: keysFile ? jwks : null }).checks);
   show(checks, checks.every(c => c.ok));
 }
 

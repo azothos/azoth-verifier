@@ -9,7 +9,7 @@
  * reimplemented from SPEC.md (which documents, but does not import, the
  * producer's decision journal). A cross-import would annul the evidentiary value.
  */
-import { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, verifyLinks, bySeq } from './chain.mjs';
+import { sha256Hex, canonicalCore, entryCanonical, computeEntryHash, computeRootHash, verifyLinks, bySeq } from './chain.mjs';
 import { checkTimestamp, readPem } from './timestamp.mjs';
 import { verifyIncidentPack } from './incident.mjs';
 import { verifyCompliancePack } from './compliance.mjs';
@@ -20,6 +20,7 @@ import { verifyFootprintPack } from './footprint.mjs';
 import { verifyHoldDesignation } from './litigation.mjs';
 import { verifyDossierSignature } from './signature.mjs';
 import { verifyRetention } from './retention.mjs';
+import { verifyHeadRoots, signedAt, span, LATE_ROOT_MS } from './headroot.mjs';
 
 // The chain primitives, for callers of the verifier's main module (chain.mjs holds them).
 export { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, verifyLinks };
@@ -32,6 +33,9 @@ export { sha256Hex, canonicalCore, computeEntryHash, computeRootHash, verifyLink
  */
 export function verifyChain(pack) {
   const listed = Array.isArray(pack?.entries) ? [...pack.entries].sort(bySeq) : [];
+  // An entry that carries its coreCanonical beside its core must state the core sealed (entryCanonical).
+  const restated = listed.find(e => entryCanonical(e) === null);
+  if (restated) return { ok: false, brokenAt: restated.seq, reason: 'its core is not the one its coreCanonical seals (listed entry altered)', verified: 0 };
   if (!Array.isArray(pack?.chain)) {
     return verifyLinks(listed.map(e => ({ seq: e.seq, prevHash: e.prevHash, entryHash: e.entryHash, canonical: canonicalCore(e.core) })));
   }
@@ -49,6 +53,18 @@ export function verifyChain(pack) {
     }
   }
   return { ...seg, listed: listed.length };
+}
+
+/**
+ * Check 3's line: the chain of an audit pack (a journal export, as a dossier's evidence.json or as the
+ * signed JSON pack of Check 17), with the segment it holds and the listed decisions in it.
+ * @returns {{ id: 'chain', ok: boolean, detail: string }}
+ */
+export function chainCheck(pack) {
+  const v = verifyChain(pack);
+  const segment = v.ok && v.first > 1 ? `, seq ${v.first}–${v.last}, attached to prev_hash ${String(v.startPrevHash).slice(0, 12)}…` : '';
+  const listed = v.ok && v.listed !== undefined ? `; the ${v.listed} listed decisions are in it` : '';
+  return { id: 'chain', ok: v.ok, detail: v.ok ? `chain intact (${v.verified} sealed decisions${segment})${listed}` : `${v.reason} at seq ${v.brokenAt}` };
 }
 
 /**
@@ -96,7 +112,8 @@ export function verifyDecisionPack(pack, files, { shipped = [], pinned = null } 
   }
   for (const e of entries) {
     if (broken) break;
-    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (listed entry altered) at seq ${e.seq}`;
+    if (entryCanonical(e) === null) broken = `entry ${e.seq}: its core is not the one its coreCanonical seals`;
+    else if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (listed entry altered) at seq ${e.seq}`;
     else if (!belongs(e)) broken = litigation ? `entry ${e.seq} is neither designated by this hold nor one of its acts`
       : exhaustion ? `entry ${e.seq} is not an act of this exhaustion incident`
         : footprint ? `entry ${e.seq} is not this AI footprint statement's act` : `entry ${e.seq} does not carry this dossier's decision reference`;
@@ -226,7 +243,9 @@ export function verifySealedFields(pack) {
  * timestamp whose signature holds is reported with a warning: its chain can
  * only end on certificates the dossier itself ships.
  * @param {Record<string, Uint8Array>} files
- * @param {{ tsaRootPem?: string, vaultContents?: Array<{ name: string, bytes: Uint8Array }>, keys?: { keys?: unknown[] } | null }} [opts]
+ * `publishedRoots`: the roots the producer published (readPublishedRoots over the files given with
+ * --published-roots), each proof of head-roots.json compared with the one of its hour (Check 18, step 6).
+ * @param {{ tsaRootPem?: string, vaultContents?: Array<{ name: string, bytes: Uint8Array }>, keys?: { keys?: unknown[] } | null, publishedRoots?: Array<{ hour: number, root: string, treeSize: number, token: Uint8Array | null }> | null }} [opts]
  * @returns {{ ok: boolean, checks: Array<{ id: string, ok: boolean, detail: string, level?: 'warn' }> }}
  */
 export function verifyDossier(files, opts = {}) {
@@ -290,10 +309,7 @@ export function verifyDossier(files, opts = {}) {
         if (pack.kind === 'ai_footprint') for (const c of verifyFootprintPack(pack)) checks.push(c);
         headTokens = (pack.segments ?? []).filter(seg => seg.anchor).length + (pack.heads ?? []).length;
       } else {
-        const v = verifyChain(pack);
-        const segment = v.ok && v.first > 1 ? `, seq ${v.first}–${v.last}, attached to prev_hash ${String(v.startPrevHash).slice(0, 12)}…` : '';
-        const listed = v.ok && v.listed !== undefined ? `; the ${v.listed} listed decisions are in it` : '';
-        push('chain', v.ok, v.ok ? `chain intact (${v.verified} sealed decisions${segment})${listed}` : `${v.reason} at seq ${v.brokenAt}`);
+        checks.push(chainCheck(pack));
       }
       // 15. Where the kept chain starts once the journal retention removed its oldest prefix.
       if (pack.kind !== 'platform' && pack.kind !== 'risk_profile' && pack.kind !== 'regulator') for (const c of verifyRetention(pack)) checks.push(c);
@@ -308,17 +324,32 @@ export function verifyDossier(files, opts = {}) {
     }
   }
 
-  // 4. Trusted timestamp (anchor.tsr, RFC 3161) over the manifest root_hash.
+  // 4. Trusted timestamp (anchor.tsr, RFC 3161) over the manifest root_hash — read first: Check 18 dates the export by it.
   const tsr = files['anchor.tsr'];
-  if (!tsr) {
-    if (opts.tsaRootPem && !headTokens) push('timestamp', false, '--tsa-root given, but the dossier carries no RFC 3161 token');
+  const anchor = tsr ? checkTimestamp(tsr, String(manifest.root_hash ?? ''), { shipped, pinned }) : null;
+
+  // 18. The hourly platform root a head of the dossier is a leaf of (head-roots.json, outside the manifest), and what
+  //     the signature had to state of the roots.
+  const citedRoots = checks.filter(c => c.ok && /^compliance\.root\./.test(c.id)).length;
+  const rooted = verifyHeadRoots(files, pack, {
+    shipped, pinned, published: opts.publishedRoots ?? null,
+    anchorAt: anchor?.ok ? anchor.genTime.getTime() : null, dated: headTokens > 0 || citedRoots > 0,
+  });
+  for (const c of rooted.checks) checks.push(c);
+
+  if (!anchor) {
+    if (opts.tsaRootPem && !headTokens && !rooted.proofs) push('timestamp', false, '--tsa-root given, but the dossier carries no RFC 3161 token');
   } else {
-    const t = checkTimestamp(tsr, String(manifest.root_hash ?? ''), { shipped, pinned });
-    push('timestamp', t.ok, t.detail);
-    if (t.ok && pinned) {
-      push('timestamp.root', t.trusted, t.trusted ? `chain ends on the pinned root (${t.root})` : 'the TSA chain does not end on the root given with --tsa-root');
-    } else if (t.ok) {
-      push('timestamp.root', true, `chain ends on ${t.root}, shipped in the dossier — pin the TSA's own root with --tsa-root <pem>`, 'warn');
+    push('timestamp', anchor.ok, anchor.detail);
+    if (anchor.ok && pinned) {
+      push('timestamp.root', anchor.trusted, anchor.trusted ? `chain ends on the pinned root (${anchor.root})` : 'the TSA chain does not end on the root given with --tsa-root');
+    } else if (anchor.ok) {
+      push('timestamp.root', true, `chain ends on ${anchor.root}, shipped in the dossier — pin the TSA's own root with --tsa-root <pem>`, 'warn');
+    }
+    // The export asks for anchor.tsr the moment it signs: a token dated long after the signature was added later.
+    const signed = signedAt(files);
+    if (anchor.ok && signed !== null && anchor.genTime.getTime() > signed + LATE_ROOT_MS) {
+      push('timestamp.dates', true, `anchor.tsr is dated ${anchor.genTime.toISOString()}, ${span(anchor.genTime.getTime() - signed)} after the dossier was signed (${new Date(signed).toISOString()}): the export timestamps the manifest the moment it signs it, so this token was added later — it proves the dossier existed at ${anchor.genTime.toISOString()}, not when it was signed`, 'warn');
     }
   }
 

@@ -37,6 +37,16 @@ export function canonicalCore(core) {
   return JSON.stringify(sortKeys(core));
 }
 
+/**
+ * The canonical form a listed entry is hashed from: its `core`'s (Check 3). An entry that also carries
+ * the producer's `coreCanonical` must state the same string — the core a reader sees is the core
+ * sealed. Null when the two differ.
+ */
+export function entryCanonical(entry) {
+  const canonical = canonicalCore(entry?.core);
+  return typeof entry?.coreCanonical === 'string' && entry.coreCanonical !== canonical ? null : canonical;
+}
+
 /** entry_hash = sha256(prev_hash || core_canonical) — plain concatenation, hex. */
 export function computeEntryHash(prevHash, coreCanonical) {
   return sha256Hex(prevHash + coreCanonical);

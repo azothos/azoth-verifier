@@ -6,7 +6,7 @@
  * Like the rest of the verifier, this shares nothing with Azoth's code: the
  * scope predicate below is reimplemented from SPEC.md, not imported.
  */
-import { sha256Hex, canonicalCore, computeEntryHash, verifyLinks } from './chain.mjs';
+import { sha256Hex, canonicalCore, entryCanonical, computeEntryHash, verifyLinks } from './chain.mjs';
 import { checkTimestamp } from './timestamp.mjs';
 
 const bySeq = (a, b) => a.seq - b.seq;
@@ -54,7 +54,8 @@ export function verifyIncidentPack(pack, files, { shipped = [], pinned = null } 
   for (const e of entries) {
     if (broken) break;
     const p = policyOf(e);
-    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (action altered) at seq ${e.seq}`;
+    if (entryCanonical(e) === null) broken = `entry ${e.seq}: its core is not the one its coreCanonical seals`;
+    else if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) broken = `entry_hash mismatch (action altered) at seq ${e.seq}`;
     else if (e.core?.surface !== 'governance' || !String(e.core?.decision ?? '').startsWith('incident_')) broken = `entry ${e.seq} is not an incident action`;
     else if (p.incidentId !== pack.incidentId || p.scopeHash !== pack.scopeHash) broken = `entry ${e.seq} does not name this incident and its scope`;
     else {
@@ -111,7 +112,7 @@ export function verifyIncidentPack(pack, files, { shipped = [], pinned = null } 
   const shown = Array.isArray(impact.entries) ? impact.entries : [];
   let bad = null;
   for (const e of shown) {
-    if (computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) bad = `matched entry ${e.seq} altered`;
+    if (entryCanonical(e) === null || computeEntryHash(e.prevHash, canonicalCore(e.core)) !== e.entryHash) bad = `matched entry ${e.seq} altered`;
     else if (inList && inList.get(e.seq) !== e.entryHash) bad = `entry ${e.seq} is not in the sealed matched set`;
     else if (!matchesScope(e.core, e.occurredAt, pack.scope)) bad = `entry ${e.seq} does not match the scope`;
     if (bad) break;

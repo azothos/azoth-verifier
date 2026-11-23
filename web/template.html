@@ -18,8 +18,14 @@
   <input id="dossier" type="file" accept=".zip,application/zip">
   <label for="root" data-t="root"></label>
   <input id="root" type="file" accept=".pem,.crt,.cer,text/plain">
+  <label for="publishedRoots" data-t="publishedRoots"></label>
+  <input id="publishedRoots" type="file" accept=".json,application/json" multiple>
   <label for="receipt" data-t="receipt"></label>
   <textarea id="receipt" rows="3" spellcheck="false"></textarea>
+  <label for="pack" data-t="pack"></label>
+  <input id="pack" type="file" accept=".json,application/json">
+  <label for="packSignature" data-t="packSignature"></label>
+  <textarea id="packSignature" rows="3" spellcheck="false"></textarea>
   <label for="keys" data-t="keys"></label>
   <input id="keys" type="file" accept=".json,application/json">
   <button id="run" type="button" data-t="run">Verify</button>

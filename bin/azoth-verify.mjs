@@ -8,7 +8,9 @@
  *   azoth-verify <dossier.zip | dossier-dir> --keys <jwks.json>   human-readable PASS/FAIL per check
  *   azoth-verify <dossier> --keys <jwks.json> --json              machine-readable, for CI
  *   azoth-verify <dossier> --tsa-root root.pem                    pin the time-stamping authority's root
+ *   azoth-verify <dossier> --published-roots roots.json           compare its hourly roots with the published ones
  *   azoth-verify receipt <token|file> --dossier <dossier> | --keys <jwks.json>   a call's receipt (Check 10)
+ *   azoth-verify export <body.json> --signature <token|file> --keys <jwks.json>  a signed JSON evidence pack (Check 17)
  *
  * Exit code 0 = every check PASS, 1 = any FAIL (or a usage error). Zero runtime
  * dependencies, zero network. Reimplements the manifest + chain algorithms
@@ -19,12 +21,16 @@ import { join, basename } from 'node:path';
 import { readZip } from '../src/zip.mjs';
 import { verifyDossier } from '../src/verify.mjs';
 import { verifyReceipt } from '../src/receipt.mjs';
+import { verifyExport } from '../src/export.mjs';
+import { readPublishedRoots } from '../src/headroot.mjs';
 
 const HELP = `azoth-verify — verify an Azoth audit dossier independently
 
 Usage:
   azoth-verify <dossier.zip | dossier-dir> --keys <jwks.json> [--json] [--tsa-root <root.pem>] [--vault-content <file|dir>]
+               [--published-roots <roots.json>]
   azoth-verify receipt <token | file> [--dossier <dossier>] [--keys <jwks.json>] [--json]
+  azoth-verify export <body.json> --signature <token | file> --keys <jwks.json> [--workspace <id>] [--json]
 
 Checks:
   - every file's sha256 matches manifest.json
@@ -38,6 +44,19 @@ Checks:
   - when the dossier carries anchor.tsr: the RFC 3161 timestamp covers
     root_hash under a valid TSA signature; with --tsa-root, its chain ends
     on that root (without it: WARN, the chain ends on a root the dossier ships)
+  - when the dossier carries head-roots.json: each head it names is one of the
+    dossier's sealed links and a leaf of an hourly platform root (Merkle
+    inclusion proof), and that root's RFC 3161 token is valid — trusted with
+    --tsa-root, as above — and dated neither before its hour nor before the
+    entries it covers nor after the dossier was signed (WARN when dated more
+    than 2 h late); WARN when head-roots.json is missing although the signature
+    says the export shipped one, or that the producer dated heads by then
+  - with --published-roots <roots.json> (repeatable): each of those roots is the
+    one the producer published for its hour — a file you saved from its
+    /api/proof/head-roots?from=<hour>&to=<hour> (read from disk: the verifier
+    fetches nothing); another root, tree size or token FAILS (the chain was
+    rooted again after the publication); an hour the files do not cover is
+    said (WARN: not compared)
   - signature.jws (required): the workspace's Ed25519 key — Azoth's platform key,
     for a platform package — signed root_hash, and the key is one of those given
     with --keys (the keys Azoth publishes). Without --keys, or without
@@ -50,6 +69,12 @@ Checks:
   - receipt: a call's receipt (the x-azoth-receipt header) is signed by one of the
     workspace's keys (--keys, or the dossier's keys.jwks.json); with --dossier, the
     dossier verifies and the decision the receipt certifies is sealed in its chain
+  - export: a JSON evidence pack (GET /api/v1/journal/export, saved exactly as
+    received) and its X-Azoth-Export-Signature header (the token, or a file
+    holding it or the header line): the body's sha256 is the one signed, by one of
+    the workspace's keys given with --keys, at an instant that key may sign; the
+    pack is the workspace's (and, with --workspace or a JWKS that names it, the
+    keys'); it lists what the signature commits; its chain verifies
 
 Exit code: 0 = all PASS (warnings allowed), 1 = any FAIL. No network, no dependencies.`;
 
@@ -117,8 +142,35 @@ function runReceipt(argv) {
   print({ ok: checks.every(c => c.ok), checks }, json, 'receipt');
 }
 
+/** Check 17: `azoth-verify export <body.json> --signature <token|file> --keys <jwks.json> [--workspace <id>] [--json]`. */
+function runExport(argv) {
+  const json = argv.includes('--json');
+  const opt = (name, what) => {
+    const at = argv.indexOf(name);
+    if (at < 0) return undefined;
+    const v = argv[at + 1];
+    if (!v || v.startsWith('-')) die(`error: ${name} needs ${what}. Try --help.`);
+    return v;
+  };
+  const signatureArg = opt('--signature', 'the X-Azoth-Export-Signature value, or a file holding it');
+  const keysPath = opt('--keys', 'a JWKS file');
+  const workspace = opt('--workspace', 'a workspace id');
+  const optionValues = new Set(argv.flatMap((a, i) => (['--signature', '--keys', '--workspace'].includes(a) ? [i + 1] : [])));
+  const target = argv.find((a, i) => !a.startsWith('-') && !optionValues.has(i));
+  if (!target) die('error: no evidence pack given (the body GET /api/v1/journal/export answered, saved as received). Try --help.');
+  if (!signatureArg) die('error: no signature — give --signature with the X-Azoth-Export-Signature header (the token, or a file holding it).');
+  if (!keysPath) die('error: no keys — give --keys with the workspace\'s published keys (/api/proof/keys/<workspace>): a pack ships none of its own.');
+  let body;
+  try { body = new Uint8Array(readFileSync(target)); } catch (err) { die(`error: could not read the evidence pack: ${err.message}`); }
+  const signature = existsSync(signatureArg) && statSync(signatureArg).isFile() ? readFileSync(signatureArg, 'utf8') : signatureArg;
+  let keys;
+  try { keys = JSON.parse(readFileSync(keysPath, 'utf8')); } catch (err) { die(`error: could not read --keys: ${err.message}`); }
+  print(verifyExport(body, signature, { keys, workspace }), json, 'evidence pack');
+}
+
 export function run(argv) {
   if (argv[0] === 'receipt') return runReceipt(argv.slice(1));
+  if (argv[0] === 'export') return runExport(argv.slice(1));
   if (argv.length === 0 || argv.includes('-h') || argv.includes('--help')) {
     process.stdout.write(HELP + '\n');
     process.exit(argv.length === 0 ? 1 : 0);
@@ -133,7 +185,10 @@ export function run(argv) {
   const keysAt = argv.indexOf('--keys');
   const keysPath = keysAt >= 0 ? argv[keysAt + 1] : undefined;
   if (keysAt >= 0 && (!keysPath || keysPath.startsWith('-'))) die('error: --keys needs a JWKS file. Try --help.');
-  const optionValues = new Set(argv.flatMap((a, i) => (a === '--tsa-root' || a === '--vault-content' || a === '--keys' ? [i + 1] : [])));
+  // --published-roots <file>, repeatable: the roots the producer published (its /api/proof/head-roots answers, saved).
+  const publishedPaths = argv.flatMap((a, i) => (a === '--published-roots' ? [argv[i + 1]] : []));
+  if (publishedPaths.some(p => !p || p.startsWith('-'))) die('error: --published-roots needs a JSON file. Try --help.');
+  const optionValues = new Set(argv.flatMap((a, i) => (['--tsa-root', '--vault-content', '--keys', '--published-roots'].includes(a) ? [i + 1] : [])));
   const target = argv.find((a, i) => !a.startsWith('-') && !optionValues.has(i));
   if (!target) die('error: no dossier path given. Try --help.');
 
@@ -161,7 +216,16 @@ export function run(argv) {
     } catch (err) { die(`error: could not read --vault-content ${p}: ${err.message}`); }
   }
 
-  print(verifyDossier(files, { tsaRootPem, vaultContents, keys }), json, 'dossier');
+  let publishedRoots = null;
+  for (const p of publishedPaths) {
+    let read;
+    try { read = readPublishedRoots(new Uint8Array(readFileSync(p))); }
+    catch (err) { die(`error: could not read --published-roots ${p}: ${err.message}`); }
+    if (read.error) die(`error: --published-roots ${p}: ${read.error}`);
+    publishedRoots = [...(publishedRoots ?? []), ...read.roots];
+  }
+
+  print(verifyDossier(files, { tsaRootPem, vaultContents, keys, publishedRoots }), json, 'dossier');
 }
 
 run(process.argv.slice(2));

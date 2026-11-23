@@ -1,6 +1,6 @@
 # @azothos/verifier — `azoth-verify`
 
-Verify an Azoth OS evidence dossier, or the receipt of a single call, **without Azoth**: no
+Verify an Azoth OS evidence dossier, a signed JSON evidence pack, or the receipt of a single call, **without Azoth**: no
 dependency, no network call, and no code shared with the producer. Its verdict does not rest on
 trusting the party that produced the evidence.
 
@@ -57,8 +57,9 @@ Change one byte of `demo-dossier.zip` and run it again: it fails, and says which
 
 [`web/azoth-verify.html`](web/azoth-verify.html) is one self-contained page that runs the same
 checks in the browser. Its own content security policy forbids any network access
-(`connect-src 'none'`): open it from a file, choose a dossier and the workspace's published keys
-(and, optionally, the authority's root), and nothing leaves the page. The page does not embed an example —
+(`connect-src 'none'`): open it from a file, choose a dossier — or a JSON evidence pack, with its
+signature pasted — and the workspace's published keys (and, optionally, the authority's root), and
+nothing leaves the page. The page does not embed an example —
 it would change the page's hash — so download `examples/demo-dossier.zip` and drop it in.
 
 The page is built from the same modules as the command line, with `src/crypto-web.mjs` (plain
@@ -72,16 +73,32 @@ publishes the same file on GitHub Pages, so the page can be opened from outside 
 
 ```text
 azoth-verify <dossier.zip | dossier-dir> --keys <jwks.json> [--json] [--tsa-root <root.pem>] [--vault-content <file|dir>]
+             [--published-roots <roots.json>]
 azoth-verify receipt <token | file> [--dossier <dossier>] [--keys <jwks.json>] [--json]
+azoth-verify export <body.json> --signature <token | file> --keys <jwks.json> [--workspace <id>] [--json]
 ```
 
 | Option | What it does |
 |---|---|
 | `--keys <jwks.json>` | Pins the workspace's public keys (Azoth's platform keys, for a platform package): the dossier's signature and the receipts must be signed by one of them. Required for a dossier to verify: without it, the signature can only be checked against the keys the dossier ships, which vouch for nothing — the dossier fails, and says so. |
-| `--tsa-root <root.pem>` | Pins the root certificate of the time-stamping authority: a timestamp is trusted only if its chain ends there. Without it, a valid timestamp is reported with a warning. |
+| `--tsa-root <root.pem>` | Pins the root certificate of the time-stamping authority: a timestamp is trusted only if its chain ends there — or on a copy of that root cross-signed by another root, as some authorities ship it in their tokens. Without it, a valid timestamp is reported with a warning. |
 | `--vault-content <file\|dir>` | Content you decrypted from your own vault (or its stored envelope): each file must hash to a sealed vault receipt. Repeatable. |
+| `--published-roots <roots.json>` | The hourly roots the producer published, as you saved them from its `/api/proof/head-roots?from=<hour>&to=<hour>` (read from disk: the verifier fetches nothing). Each root the dossier's `head-roots.json` leads to must be the one published for its hour — another root, tree size or token fails (the chain was rooted again after the publication); an hour your files do not cover is said, not compared. Repeatable (SPEC.md, Check 18, step 6). |
 | `--dossier <dossier>` | With `receipt`: the dossier must verify, and hold the decision the receipt certifies. |
+| `--signature <token \| file>` | With `export`: the `X-Azoth-Export-Signature` header of the JSON evidence pack — the token, or a file holding it or the header line (`curl -D headers.txt` writes one). |
+| `--workspace <id>` | With `export`: the workspace you fetched the keys for. The pack, its signature and the keys must be that workspace's; without it (and without a `workspaceId` in the JWKS), a warning. |
 | `--json` | Machine-readable output, for a pipeline. |
+
+**A JSON evidence pack.** `GET /api/v1/journal/export` (without `format=dossier`) answers the
+journal's evidence pack as JSON, signed in the `X-Azoth-Export-Signature` header. Save the body
+exactly as received — `curl -o pack.json -D headers.txt …`, never re-indented — then:
+
+```sh
+azoth-verify export pack.json --signature headers.txt --keys keys.jwks.json --workspace <workspaceId>
+```
+
+It checks that the body is the one signed, by one of the workspace's keys, what the signature says the
+pack covers, and the pack's chain (Check 17).
 
 **Exit codes**: `0` — every check passed (warnings allowed); `1` — a check failed, or the command
 could not run (a usage error, an unreadable file).
@@ -115,6 +132,8 @@ The numbers are stable: a new check takes the next number.
 | 14 | An AI footprint statement |
 | 15 | The journal retention checkpoint: where the kept chain starts once the oldest entries were removed |
 | 16 | Each entry's time, actor type and trace, as its core seals them |
+| 17 | A signed JSON evidence pack (`X-Azoth-Export-Signature`): its exact body, its key, its coverage and its chain |
+| 18 | The hourly platform root (`head-roots.json`): a head the dossier carries is a leaf of a Merkle root an RFC 3161 authority dated, the token dated neither before its hour, nor before the entries it covers, nor after the signature; the file as the signature commits it; with `--published-roots`, each root the one the producer published for its hour |
 
 ## As a library
 
@@ -122,8 +141,10 @@ The numbers are stable: a new check takes the next number.
 import { verifyDossier } from '@azothos/verifier';
 import { readZip } from '@azothos/verifier/zip';
 import { verifyReceipt } from '@azothos/verifier/receipt';
+import { verifyExport } from '@azothos/verifier/export';
 
 const result = verifyDossier(readZip(bytes), { keys: jwks });   // { ok, checks: [{ id, ok, detail, level? }] }
+const pack = verifyExport(bodyBytes, signatureHeader, { keys: jwks, workspace });   // the same shape
 ```
 
 ## Requirements

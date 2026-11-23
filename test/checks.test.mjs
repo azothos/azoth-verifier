@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { canonicalCore, computeEntryHash, computeRootHash, verifyChain, verifyDecisionPack, verifyDossier, verifySealedFields, verifyVaultContents } from '../src/verify.mjs';
 import { verifyFootprintPack } from '../src/footprint.mjs';
 import { verifyHoldDesignation } from '../src/litigation.mjs';
@@ -271,6 +271,43 @@ test('a compliance bundle never inflates: each altered claim fails with its reas
   assert.match(reason((p) => { p.segments[0].anchor = { file: 'anchor-4.tsr' }; }, 'compliance.anchor.4'), /anchor-4\.tsr missing/);
   // Entries verified one by one need no segment.
   assert.equal(byId(comply((p) => { p.segments = []; p.integrity = { inclusion: 'individual' }; }), 'compliance.chain').ok, true);
+});
+
+test('a compliance bundle\'s rooted heads (source root) are held to Check 18\'s proof: one that does not hold is no evidence', () => {
+  const WS = randomUUID();
+  const H = (...parts) => { const h = createHash('sha256'); for (const x of parts) h.update(x); return h.digest('hex'); };
+  const claims = Buffer.from(JSON.stringify({ v: 2, ws: WS, iat: 1_763_715_600 })).toString('base64url');
+  const rooted = (edit = () => {}, extra = {}) => {
+    const { pack, files } = bundle((p, d, links) => {
+      d.kinds.push({ id: 'rooted', source: 'root' });
+      p.workspaceId = WS;
+      // A one-leaf tree: its root is the head's leaf hash (RFC 9162), written here with node:crypto.
+      const root = H(Uint8Array.of(0), enc(`azoth.journal-head.v1\n${WS}\n4\n${links[3].entryHash}`));
+      p.rootedHeads = [{ seq: 4, entryHash: links[3].entryHash, leafIndex: 0, treeSize: 1, path: [], root, hour: '2026-11-21T10:00:00.000Z', token: 'roots/head-root.20261121T10Z.tsr' }];
+      p.rootChain = 'roots/head-roots-chain.pem';
+      p.requirements[0].evidence.rooted = { cited: [4], sealed: 1 };
+      edit(p);
+    });
+    return verifyCompliancePack(pack, {
+      ...files, 'roots/head-root.20261121T10Z.tsr': Uint8Array.of(0x30, 0x03, 0x02, 0x01, 0x00), 'roots/head-roots-chain.pem': enc('no certificate here'),
+      'signature.jws': enc(`e30.${claims}.sig`), ...extra,
+    });
+  };
+  // The path leads to the root; the token is not one: the head is not verified, its citation refused.
+  const tokenless = rooted();
+  assert.equal(byId(tokenless, 'compliance.root.4').ok, false);
+  assert.match(byId(tokenless, 'compliance.root.4').detail, /the platform root of 2026-11-21T10:00:00\.000Z: /);
+  assert.match(byId(tokenless, 'compliance.citations').detail, /head 4 cited as rooted is not a verified head of an hourly root/);
+  // Its root altered, a seq the bundle's verified segments do not hold, another workspace's journal.
+  assert.match(byId(rooted(p => { p.rootedHeads[0].root = 'b'.repeat(64); }), 'compliance.root.4').detail, /does not lead to the root/);
+  assert.match(byId(rooted(p => { p.rootedHeads[0].seq = 7; }), 'compliance.root.7').detail, /seq 7 is not one of the sealed links/);
+  assert.match(byId(rooted(p => { p.segments = []; p.integrity = { inclusion: 'individual' }; }), 'compliance.root.4').detail, /seq 4 is not one of the sealed links/);
+  assert.match(byId(rooted(p => { p.workspaceId = undefined; }), 'compliance.root.4').detail, /names no workspace/);
+  assert.match(byId(rooted(p => { p.rootedHeads[0].seq = 'x'; }), 'compliance.root.?').detail, /not one of the sealed links/);
+  // A chain file that is not one, or none at all: the proof is still read, its token still refused.
+  assert.equal(byId(rooted(p => { p.rootChain = null; }), 'compliance.root.4').ok, false);
+  // No rooted head cited and none shipped: no line, the bundle as before.
+  assert.deepEqual(failing(rooted(p => { p.rootedHeads = []; delete p.requirements[0].evidence.rooted; })), []);
 });
 
 test('an evidence kind is a predicate over the sealed core', () => {

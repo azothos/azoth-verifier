@@ -38,10 +38,22 @@ export function coverageOf(pack) {
   return { count: seqs.length, first: seqs.length ? Math.min(...seqs) : null, last: seqs.length ? Math.max(...seqs) : null };
 }
 
-/** Every sealed link a pack carries, wherever it sits: [{ seq, entryHash }]. */
-function carried(pack) {
+/** The time a link's core seals (`occurredAt`, its `core` — else its `coreCanonical` — read), or null. */
+function sealedAt(link) {
+  let core = link?.core && typeof link.core === 'object' ? link.core : null;
+  if (!core && typeof link?.coreCanonical === 'string') {
+    try { core = JSON.parse(link.coreCanonical); } catch { core = null; }
+  }
+  return typeof core?.occurredAt === 'string' ? core.occurredAt : null;
+}
+
+/**
+ * Every sealed link a pack carries, wherever it sits: [{ seq, entryHash, sealedAt }] (also Check 18's) — `sealedAt`
+ * the time its core seals, null when it seals none.
+ */
+export function carried(pack) {
   const out = [];
-  const add = list => { for (const l of Array.isArray(list) ? list : []) out.push({ seq: Number(l?.seq), entryHash: l?.entryHash }); };
+  const add = list => { for (const l of Array.isArray(list) ? list : []) out.push({ seq: Number(l?.seq), entryHash: l?.entryHash, sealedAt: sealedAt(l) }); };
   add(pack?.entries); add(pack?.chain);
   for (const s of Array.isArray(pack?.segments) ? pack.segments : []) add(s?.links);
   add(pack?.impact?.entries); add(pack?.impact?.completeness?.links);
@@ -51,7 +63,8 @@ function carried(pack) {
 const range = c => (c.count ? (c.first === c.last ? `seq ${c.first}` : `seq ${c.first}–${c.last}`) : 'nothing');
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
-function wellFormedV2(c) {
+/** Format 2 claims' coverage is well formed — a dossier's signature, and a JSON pack's (Check 17). */
+export function wellFormedV2(c) {
   const e = c?.entries;
   const head = c?.head;
   return DOSSIER_KINDS.includes(c?.kind)
@@ -63,24 +76,25 @@ function wellFormedV2(c) {
 
 /**
  * Format 2: what the signature committed, against evidence.json. FAILs when the pack does not hold
- * what was signed; else one PASS line saying plainly what the dossier covers.
+ * what was signed; else one PASS line saying plainly what the dossier covers. A JSON evidence pack's
+ * signature (Check 17) commits the same coverage: `file` and `whole` name it there, `id` its check.
  */
-function verifyCoverage(claims, pack) {
-  const push = (ok, detail, id = 'coverage') => [{ id, ok, detail }];
+export function verifyCoverage(claims, pack, { id = 'coverage', file = 'evidence.json', whole = 'the dossier' } = {}) {
+  const push = (ok, detail) => [{ id, ok, detail }];
   const kind = kindOf(pack);
-  if (claims.kind !== kind) return push(false, `the signature is for a ${claims.kind} dossier; evidence.json is a ${kind} dossier`);
+  if (claims.kind !== kind) return push(false, `the signature is for a ${claims.kind} dossier; ${file} is a ${kind} dossier`);
   const got = coverageOf(pack);
   const want = claims.entries;
   if (got.count !== want.count || got.first !== want.first || got.last !== want.last) {
-    return push(false, `evidence.json lists ${plural(got.count, 'entry', 'entries')} (${range(got)}); the signature committed ${plural(want.count, 'entry', 'entries')} (${range(want)}) — entries were removed, added or renumbered after signing`);
+    return push(false, `${file} lists ${plural(got.count, 'entry', 'entries')} (${range(got)}); the signature committed ${plural(want.count, 'entry', 'entries')} (${range(want)}) — entries were removed, added or renumbered after signing`);
   }
   const links = carried(pack).filter(l => Number.isFinite(l.seq));
   const head = claims.head;
   if (!head) {
-    if (links.length) return push(false, `the signature says the journal was empty at export, but the dossier carries seq ${links[0].seq}`);
+    if (links.length) return push(false, `the signature says the journal was empty at export, but ${whole} carries seq ${links[0].seq}`);
   } else {
     const after = links.find(l => l.seq > head.seq);
-    if (after) return push(false, `the dossier carries seq ${after.seq}, after the chain's head the signature committed (seq ${head.seq})`);
+    if (after) return push(false, `${whole} carries seq ${after.seq}, after the chain's head the signature committed (seq ${head.seq})`);
     const atHead = links.find(l => l.seq === head.seq && l.entryHash !== head.hash);
     if (atHead) return push(false, `the entry at seq ${head.seq} is not the chain's head the signature committed (${head.hash.slice(0, 12)}…)`);
   }
